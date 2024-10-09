@@ -1,54 +1,50 @@
 import polars as pl
+import torch
 from torch.utils.data import Dataset
+from functools import partial
 
 
-def tokenize(dataset_path, tokenizer, tokenizer_args):
-    dataset = (
-        pl.read_parquet(dataset_path)
-        .select(["text", pl.col("domain").to_physical()])
-        .sample(fraction=1.0, shuffle=True, seed=42)
+def tokenize_dataset(dataset, tokenizer, max_length):
+
+    def preprocess_function(examples, label2id, max_length):
+        processed = tokenizer(
+            examples["text"],
+            padding="max_length",
+            truncation=True,
+            max_length=max_length,
+        )
+        processed["label"] = [label2id[domain] for domain in examples["domain"]]
+        return processed
+
+    domains = sorted(dataset.unique("domain"))
+    label2id = dict(zip(domains, range(len(domains))))
+    dataset = dataset.map(
+        partial(preprocess_function, label2id=label2id, max_length=max_length),
+        batched=True,
+        batch_size=2048,
+        keep_in_memory=True,
+        remove_columns=[
+            col for col in dataset.features.keys() if col not in ["domain", "text"]
+        ],
     )
-    tokenized = tokenizer(dataset["text"].to_list(), **tokenizer_args)
-    ids = tokenized.input_ids
-    labels = dataset["domain"]
-    mydataset = MyDataset(ids, labels)
-    return mydataset
+
+    return dataset
 
 
-class MyDataset(Dataset):
-    def __init__(self, ids, labels):
-        self.ids = ids
-        self.labels = labels
+class DumbDataset(Dataset):
+    def __init__(self, hfdataset, device):
+        self.input_ids = []
+        self.attn_mask = []
+        self.label = []
+        for row in hfdataset:
+            self.input_ids.append(torch.tensor(row["input_ids"], device=device))
+            self.attn_mask.append(torch.tensor(row["attention_mask"], device=device))
+            self.label.append(torch.tensor(row["label"], device=device))
 
     def __len__(self):
-        return len(self.ids)
+        return len(self.input_ids)
 
-    def __getitem__(self, idx):
-        ids = self.ids[idx]
-        labels = self.labels[idx]
-        return ids, labels
+    def __getitem__(self, index):
+        out = dict(input_ids=self.input_ids[index], attention_mask=self.attn_mask[index], label=self.label[index])
+        return out
 
-    def save(self, path):
-        out = pl.DataFrame(dict(ids=self.ids, labels=self.labels))
-        out.write_parquet(path)
-
-    @classmethod
-    def load(cls, path):
-        data = pl.read_parquet(path)
-        return cls(data["ids"].to_list(), data["labels"].to_list())
-
-
-# def teste():
-#     from transformers import AutoTokenizer
-
-#     tokenizer = AutoTokenizer.from_pretrained(
-#         "PORTULAN/albertina-1b5-portuguese-ptbr-encoder-256"
-#     )
-#     ids, labels = tokenize(
-#         "Data/caroldb-train-sentences.parquet",
-#         tokenizer=tokenizer,
-#         tokenizer_args=dict(padding="max_length", truncation=True, max_length=512),
-#     )
-
-#     dataset = MyDataset(ids, labels)
-#     return dataset
