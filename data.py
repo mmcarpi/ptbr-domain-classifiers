@@ -45,6 +45,9 @@ class DumbDataset(Dataset):
         return len(self.input_ids)
 
     def __getitem__(self, index):
-        out = dict(input_ids=self.input_ids[index], attention_mask=self.attn_mask[index], label=self.label[index])
+        out = dict(
+            input_ids=self.input_ids[index],
+            attention_mask=self.attn_mask[index],
+            label=self.label[index],
+        )
         return out
-
