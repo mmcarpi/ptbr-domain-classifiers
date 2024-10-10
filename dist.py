@@ -1,12 +1,17 @@
 import argparse
 import gc
 import os
-import sys
 import time
 from contextlib import nullcontext
 
 import torch
-from torch.distributed import init_process_group, destroy_process_group
+
+from torch.distributed import (
+    init_process_group,
+    destroy_process_group,
+    all_reduce,
+    ReduceOp,
+)
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -17,9 +22,9 @@ import optuna
 from optuna.trial import TrialState
 
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
-#from train import Trainer, init_model, warm_up_scheduler
 
-import data
+
+from data import tokenize_dataset
 
 start_time = None
 
@@ -34,47 +39,65 @@ def start_timer():
 
 
 def end_timer_and_print(local_msg):
-    #torch.cuda.synchronize()
+    torch.cuda.synchronize()
     end_time = time.time()
     print("\n" + local_msg)
     print("Total execution time = %.3f sec" % (end_time - start_time))
     print("Max memory used by tensors = %d bytes" % (torch.cuda.max_memory_allocated()))
 
 
-def forward_backward_autocast(model, optimizer, loss_fn, input_ids, attention_mask, target, device_type):
-    with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-        output = model(input_ids=input_ids, attention_mask=attention_mask).logits
-        loss = loss_fn(output, target)
-
-    loss.backward()
-    optimizer.step()
-    optimizer.zero_grad(set_to_none=True)
-
-
-def train_loop_autocast(model, dataloader, optimizer, loss_fn, num_epochs, gradient_accumulation_steps, device_type):
+def train_loop_autocast(
+    local_rank,
+    model,
+    train_dataloader,
+    optimizer,
+    loss_fn,
+    num_epochs,
+    gradient_accumulation_steps,
+    device_type,
+):
     start_timer()
     model.train()
     for epoch in range(num_epochs):  # 0 epochs, this section is for illustration only
-        dataloader.sampler.set_epoch(epoch)
-        #for input_ids, attn_mask, target in dataloader:
-        for i, data in enumerate(dataloader):
+        train_dataloader.sampler.set_epoch(epoch)
+        # for input_ids, attn_mask, target in dataloader:
+        for i, data in enumerate(train_dataloader):
             # Runs the forward pass under ``autocast``.
-            with (nullcontext() if i % gradient_accumulation_steps == 0 else model.no_sync()):
-                forward_backward_autocast(model, optimizer, loss_fn, data['input_ids'], data['attention_mask'], data['label'], device_type)
+            with (
+                nullcontext()
+                if i % gradient_accumulation_steps == 0
+                else model.no_sync()
+            ):
+                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                    output = model(
+                        input_ids=data["input_ids"].to(local_rank, non_blocking=True),
+                        attention_mask=data["attention_mask"].to(
+                            local_rank, non_blocking=True
+                        ),
+                    ).logits
+                    loss = loss_fn(
+                        output, data["label"].to(local_rank, non_blocking=True)
+                    )
+
+                loss.backward()
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
 
     end_timer_and_print("Automatic precision")
 
 
-def eval_loop_autocast(model, batched_dataset):
+def eval_loop_autocast(local_rank, model, test_dataloader, device_type):
     model.eval()
-    with torch.no_grad():
-        acc = torch.Tensor(0.0)
-        for input_ids, attn_mask, target in batched_dataset:
+    with torch.no_grad(), torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+        acc = torch.tensor(0.0, device=local_rank)
+        for data in test_dataloader:
             prediction = model(
-                input_ids=input_ids, attention_mask=attn_mask
+                input_ids=data["input_ids"].to(local_rank, non_blocking=True),
+                attention_mask=data["attention_mask"].to(local_rank, non_blocking=True),
             ).logits.argmax(dim=-1)
-            acc += (prediction == target).sum()
-        acc /= len(batched_dataset) * batched_dataset.batch_size
+            acc += (prediction == data["label"].to(local_rank, non_blocking=True)).sum()
+        all_reduce(acc, ReduceOp.SUM, async_op=False)
+        acc /= len(test_dataloader.dataset)
     return acc.item()
 
 
@@ -95,70 +118,75 @@ def main():
     local_rank = int(os.environ["LOCAL_RANK"])
     print("Hello from", local_rank, rank)
 
-    model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=num_labels)
-    model = torch.compile(model).to(local_rank)
+    model = AutoModelForSequenceClassification.from_pretrained(
+        model_name, num_labels=num_labels
+    )
+    model = torch.compile(model, disable=True).to(local_rank)
     model = DDP(model, device_ids=[local_rank], output_device=local_rank)
 
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=learning_rate, weight_decay=weight_decay
     )
 
-    dataset = load_dataset("mmcarpi/caroldb-sentences", split="hps")#.select(range(16_000))
+    dataset = load_dataset("mmcarpi/caroldb-sentences", split="hps").select(
+        range(1_000)
+    )
     tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False)
 
-    dataset = data.tokenize_dataset(dataset, tokenizer, max_length)
-    dataset = dataset.with_format('torch', device=local_rank)
-    #dataset = data.DumbDataset(dataset, device=local_rank)
+    dataset = tokenize_dataset(dataset, tokenizer, max_length)
+    # dataset = dataset.with_format("torch", device=local_rank)# TODO: Try using pin_memory
+    dataset = dataset.with_format("torch")  # TODO: Try using pin_memory
+    dataset = dataset.train_test_split(test_size=0.1)
 
+    train_dataset = dataset["train"]
 
-    sampler = DistributedSampler(dataset)
+    train_sampler = DistributedSampler(train_dataset)
 
-    dataloader = DataLoader(
-            dataset=dataset,
-            sampler=sampler,
-            batch_size=batch_size,
-            shuffle=False,
-            pin_memory=False,
+    train_dataloader = DataLoader(
+        dataset=train_dataset,
+        sampler=train_sampler,
+        batch_size=batch_size,
+        shuffle=False,
+        pin_memory=True,
     )
 
     loss_fn = torch.nn.CrossEntropyLoss().to(local_rank)
 
     print(f"[GPU{local_rank}] starting training soon...")
-    train_loop_autocast(model, dataloader, optimizer, loss_fn, num_epochs, gradient_accumulation_steps, device_type='cuda' if torch.cuda.is_available() else 'cpu')
+    device_type = "cuda" if torch.cuda.is_available() else "cpu"
+    train_loop_autocast(
+        local_rank,
+        model,
+        train_dataloader,
+        optimizer,
+        loss_fn,
+        num_epochs,
+        gradient_accumulation_steps,
+        device_type,
+    )
     print(f"[GPU{local_rank}] finished training")
+    test_dataset = dataset["test"]
+    test_sampler = DistributedSampler(test_dataset)
+    test_dataloader = DataLoader(
+        test_dataset,
+        sampler=test_sampler,
+        batch_size=batch_size,
+        shuffle=False,
+        pin_memory=False,
+    )
+    acc = eval_loop_autocast(
+        local_rank, model, test_dataloader, device_type=device_type
+    )
+
+    if rank == 0:
+        print("accuracy on test_dataset: %.3f" % acc)
 
     destroy_process_group()
 
 
 if __name__ == "__main__":
     main()
-sys.exit(0)
 
-model_name = "neuralmind/bert-base-portuguese-cased"
-model_name = "PORTULAN/albertina-900m-portuguese-ptbr-encoder"
-#model_name = "PORTULAN/albertina-1b5-portuguese-ptbr-encoder-256"
-
-def train_loop(model, opt, loss_fn, data, mask, target):
-    start_timer()
-    for epoch in range(num_epochs):
-        for x, m, t in zip(data, mask, target):
-            output = model(input_ids=x, attention_mask=m).logits
-            loss = loss_fn(output, t)
-            loss.backward()
-            opt.step()
-            opt.zero_grad(set_to_none=True)
-    end_timer_and_print("Default precision")
-
-
-
-def eval_loop_autocast(model, batched_dataset):
-    model.eval()
-    with torch.no_grad():
-        acc = torch.Tensor(0.0)
-        for input_ids, attn_mask, target in batched_dataset:
-            prediction = model(
-                input_ids=input_ids, attention_mask=attn_mask
-            ).logits.argmax(dim=-1)
-            acc += (prediction == target).sum()
-        acc /= len(batched_dataset) * batched_dataset.batch_size
-    return acc.item()
+# model_name = "neuralmind/bert-base-portuguese-cased"
+# model_name = "PORTULAN/albertina-900m-portuguese-ptbr-encoder"
+# model_name = "PORTULAN/albertina-1b5-portuguese-ptbr-encoder-256"
