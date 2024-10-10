@@ -5,6 +5,7 @@ import time
 from contextlib import nullcontext
 
 import torch
+from torch.amp import GradScaler
 
 from torch.distributed import (
     init_process_group,
@@ -38,12 +39,12 @@ def start_timer():
     start_time = time.time()
 
 
-def end_timer_and_print(local_msg):
+def end_timer_and_print(local_msg, local_rank):
     torch.cuda.synchronize()
     end_time = time.time()
     print("\n" + local_msg)
     print("Total execution time = %.3f sec" % (end_time - start_time))
-    print("Max memory used by tensors = %d bytes" % (torch.cuda.max_memory_allocated()))
+    print("Max memory used by tensors = %d bytes" % (torch.cuda.max_memory_allocated(device=local_rank)))
 
 
 def train_loop_autocast(
@@ -53,21 +54,20 @@ def train_loop_autocast(
     optimizer,
     loss_fn,
     num_epochs,
-    gradient_accumulation_steps,
+    iters_to_accumulate,
     device_type,
 ):
     start_timer()
     model.train()
+    scaler = GradScaler()
     for epoch in range(num_epochs):  # 0 epochs, this section is for illustration only
         train_dataloader.sampler.set_epoch(epoch)
         # for input_ids, attn_mask, target in dataloader:
         for i, data in enumerate(train_dataloader):
             # Runs the forward pass under ``autocast``.
-            with (
-                nullcontext()
-                if i % gradient_accumulation_steps == 0
-                else model.no_sync()
-            ):
+            accumulation_iteration = (i + 1) % iters_to_accumulate == 0
+            context_manager = nullcontext() if accumulation_iteration else model.no_sync()
+            with context_manager:
                 with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
                     output = model(
                         input_ids=data["input_ids"].to(local_rank, non_blocking=True),
@@ -78,12 +78,14 @@ def train_loop_autocast(
                     loss = loss_fn(
                         output, data["label"].to(local_rank, non_blocking=True)
                     )
+                    loss /= iters_to_accumulate
+                scaler.scale(loss).backward()
+                if accumulation_iteration:
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad()
 
-                loss.backward()
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
-
-    end_timer_and_print("Automatic precision")
+    end_timer_and_print("Automatic precision", local_rank)
 
 
 def eval_loop_autocast(local_rank, model, test_dataloader, device_type):
@@ -106,14 +108,18 @@ def main():
     model_name = "neuralmind/bert-base-portuguese-cased"
     num_labels = 5
     max_length = 256
-    batch_size = 64
-    gradient_accumulation_steps = 1024 // batch_size
+    batch_size = 32
+    iters_to_accumulate = 1#1024//batch_size
 
     num_epochs = 1
     learning_rate = 1e-4
     weight_decay = 0.01
+    seed = 50
+
+    torch.manual_seed(seed)
 
     init_process_group(backend="nccl")
+    n_process = int(os.environ["WORLD_SIZE"])
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
     print("Hello from", local_rank, rank)
@@ -128,15 +134,13 @@ def main():
         model.parameters(), lr=learning_rate, weight_decay=weight_decay
     )
 
-    dataset = load_dataset("mmcarpi/caroldb-sentences", split="hps").select(
-        range(1_000)
-    )
+    dataset = load_dataset("mmcarpi/caroldb-sentences", split="hps")
     tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False)
 
     dataset = tokenize_dataset(dataset, tokenizer, max_length)
     # dataset = dataset.with_format("torch", device=local_rank)# TODO: Try using pin_memory
     dataset = dataset.with_format("torch")  # TODO: Try using pin_memory
-    dataset = dataset.train_test_split(test_size=0.1)
+    dataset = dataset.train_test_split(test_size=0.1, seed=seed)
 
     train_dataset = dataset["train"]
 
@@ -161,7 +165,7 @@ def main():
         optimizer,
         loss_fn,
         num_epochs,
-        gradient_accumulation_steps,
+        iters_to_accumulate,
         device_type,
     )
     print(f"[GPU{local_rank}] finished training")
