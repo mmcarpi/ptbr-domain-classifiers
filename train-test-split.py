@@ -4,7 +4,7 @@ from sklearn.model_selection import train_test_split
 random_state = 42
 min_sentence_length = 4
 max_sentence_length = 256
-hps_dataset_size = 100_000
+hps_dataset_fraction = 0.01
 df = pl.read_parquet("Data/caroldb-sentences.parquet")
 
 domains = df["domain"].unique()
@@ -17,18 +17,19 @@ df = df.filter(
 df = df.unique()
 number_of_texts = df.group_by("domain").len()["len"].min()
 
-dfs = []
+df_balanced = pl.DataFrame(schema=df.schema)
 for domain in df["domain"].unique():
-    dfs.append(
+    df_balanced.vstack(
         df.filter(pl.col("domain") == domain).sample(
             number_of_texts, shuffle=True, seed=random_state
-        )
+        ),
+        in_place = True
     )
 
 train, test = train_test_split(
-    df, train_size=0.8, shuffle=True, random_state=random_state
+    df_balanced, train_size=0.8, shuffle=True, random_state=random_state
 )
-hyper = train.sample(hps_dataset_size, shuffle=True)
+hyper = train.sample(fraction=hps_dataset_fraction, shuffle=True)
 hyper.write_parquet("Data/caroldb-hps-sentences.parquet")
 train.write_parquet("Data/caroldb-train-sentences.parquet")
 test.write_parquet("Data/caroldb-test-sentences.parquet")
