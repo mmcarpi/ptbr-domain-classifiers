@@ -108,12 +108,12 @@ def eval_loop_autocast(local_rank, model, test_dataloader, device_type):
     return acc.item()
 
 
-def main():
-
-    model_name = "neuralmind/bert-base-portuguese-cased"
+def main(args):
+    #TODO: Rewrite this so we have the same interface as the hyperparameter-search.py
+    model_name = args.model_name
     num_labels = 5
     max_length = 256
-    batch_size = 32
+    batch_size = args.batch_size
     iters_to_accumulate = 1
 
     num_epochs = 1
@@ -130,14 +130,11 @@ def main():
     local_rank = int(os.environ["LOCAL_RANK"])
     print("Hello from", local_rank, rank, world_size)
 
-    dataset = load_dataset("mmcarpi/caroldb-sentences", split="hps").select(
-        range(100_000)
-    )
+    dataset = load_dataset("mmcarpi/caroldb-sentences", split="hps")
     tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False)
 
     dataset = tokenize_dataset(dataset, tokenizer, max_length)
-    # dataset = dataset.with_format("torch", device=local_rank)# TODO: Try using pin_memory
-    dataset = dataset.with_format("torch")  # TODO: Try using pin_memory
+    dataset = dataset.with_format("torch")
     dataset = dataset.train_test_split(test_size=0.1, seed=seed)
 
     train_dataset = dataset["train"]
@@ -164,9 +161,7 @@ def main():
 
     total_steps = len(train_dataset) // (world_size * batch_size)
     warm_up_steps = int(total_steps * warm_up_ratio)
-    if rank == 0:
 
-        print(f"{total_steps=} {warm_up_steps=}")
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer,
         lambda step: (step / warm_up_steps) if step < warm_up_steps else 1.0,
@@ -174,7 +169,16 @@ def main():
 
     loss_fn = torch.nn.CrossEntropyLoss().to(local_rank)
 
-    print(f"[GPU{local_rank}] starting training soon...")
+    if rank == 0:
+        print(f"\nTraining info:")
+        print(f"\t{model_name=}")
+        print(f"\t{batch_size=}")
+        print(f"\t{len(train_dataset)=}")
+        print(f"\t{total_steps=}")
+        print(f"\t{warm_up_steps=}")
+        print(f"\n")
+
+    print(f"[GPU{rank}] starting training soon...")
     device_type = "cuda" if torch.cuda.is_available() else "cpu"
     train_loop_autocast(
         local_rank,
@@ -187,7 +191,7 @@ def main():
         iters_to_accumulate,
         device_type,
     )
-    print(f"[GPU{local_rank}] finished training")
+    print(f"[GPU{rank}] finished training")
     test_dataset = dataset["test"]
     test_sampler = DistributedSampler(test_dataset)
     test_dataloader = DataLoader(
@@ -208,8 +212,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("model_name", type=str)
+    parser.add_argument("batch_size", type=int)
 
-# model_name = "neuralmind/bert-base-portuguese-cased"
-# model_name = "PORTULAN/albertina-900m-portuguese-ptbr-encoder"
-# model_name = "PORTULAN/albertina-1b5-portuguese-ptbr-encoder-256"
+    args = parser.parse_args()
+    main(args)
