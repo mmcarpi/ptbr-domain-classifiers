@@ -18,8 +18,9 @@ from torch.utils.data.distributed import DistributedSampler
 
 from data import tokenize_dataset
 
-#TODO: Refactor this function to make local_rank, epoch, step, iters_to_accumulate, and device_type keyword arguments
-#TODO: After the refactor, put the new version on dist.py and import it here
+
+# TODO: Refactor this function to make local_rank, epoch, step, iters_to_accumulate, and device_type keyword arguments
+# TODO: After the refactor, put the new version on dist.py and import it here
 def train_loop_autocast(
     local_rank,
     model,
@@ -58,7 +59,8 @@ def train_loop_autocast(
                 optimizer.zero_grad()
     return step
 
-#TODO: Apply the same refactor of the previous function
+
+# TODO: Apply the same refactor of the previous function
 def eval_loop_autocast(local_rank, model, test_dataloader, device_type):
     model.eval()
     with torch.no_grad(), torch.autocast(device_type=device_type, dtype=torch.bfloat16):
@@ -90,7 +92,7 @@ def objective(single_trial, **kwargs):
     num_epochs = kwargs["num_epochs"]
 
     torch_seed = kwargs["torch_seed"]
-    compile_model = kwargs["compile_model"]
+    disable_compile = kwargs["disable_compile"]
     iters_to_accumulate = kwargs["iters_to_accumulate"]
 
     learning_rate = trial.suggest_float("learning_rate", 2e-5, 1e-4, log=True)
@@ -99,7 +101,7 @@ def objective(single_trial, **kwargs):
 
     torch.manual_seed(torch_seed)
 
-    dataset = load_dataset(dataset_name, split="hps").select(range(5_000))
+    dataset = load_dataset(dataset_name, split="hps")
     tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False)
 
     dataset = tokenize_dataset(dataset, tokenizer, max_length)
@@ -129,7 +131,7 @@ def objective(single_trial, **kwargs):
     model = AutoModelForSequenceClassification.from_pretrained(
         model_name, num_labels=num_labels
     )
-    model = torch.compile(model, disable=compile_model).to(local_rank)
+    model = torch.compile(model, disable=disable_compile).to(local_rank)
     model = DDP(model, device_ids=[local_rank], output_device=local_rank)
 
     optimizer = torch.optim.AdamW(
@@ -195,7 +197,7 @@ def main(args):
         batch_size=args.batch_size,
         num_epochs=args.num_epochs,
         torch_seed=args.torch_seed,
-        compile_model=args.compile_model,
+        disable_compile=args.disable_compile,
         iters_to_accumulate=args.iters_to_accumulate,
     )
 
@@ -208,7 +210,7 @@ def main(args):
 
     study = None
     if rank == 0:
-        name = args.model_name.split("/")[-1] + "hp-search"
+        name = args.model_name.split("/")[-1] + "-hp-search"
         study = optuna.create_study(
             study_name=name,
             storage=f"sqlite:///results/{name}.db",
@@ -258,9 +260,7 @@ if __name__ == "__main__":
     parser.add_argument("num_trials", type=int, default=50)
 
     parser.add_argument("--torch_seed", type=int, default=42)
-    parser.add_argument(
-        "--compile_model", action="store_true", default=False
-    )
+    parser.add_argument("--disable_compile", action="store_true", default=False)
     parser.add_argument("--iters_to_accumulate", type=int, default=1)
 
     args = parser.parse_args()
