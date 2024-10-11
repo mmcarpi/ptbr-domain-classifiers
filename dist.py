@@ -19,9 +19,6 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 from datasets import load_dataset
 
-import optuna
-from optuna.trial import TrialState
-
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
 
@@ -44,7 +41,10 @@ def end_timer_and_print(local_msg, local_rank):
     end_time = time.time()
     print("\n" + local_msg)
     print("Total execution time = %.3f sec" % (end_time - start_time))
-    print("Max memory used by tensors = %d bytes" % (torch.cuda.max_memory_allocated(device=local_rank)))
+    print(
+        "Max memory used by tensors = %d bytes"
+        % (torch.cuda.max_memory_allocated(device=local_rank))
+    )
 
 
 def train_loop_autocast(
@@ -52,6 +52,7 @@ def train_loop_autocast(
     model,
     train_dataloader,
     optimizer,
+    scheduler,
     loss_fn,
     num_epochs,
     iters_to_accumulate,
@@ -59,14 +60,17 @@ def train_loop_autocast(
 ):
     start_timer()
     model.train()
-    scaler = GradScaler()
+    scaler = GradScaler(device=device_type)
+    step = 0
     for epoch in range(num_epochs):  # 0 epochs, this section is for illustration only
         train_dataloader.sampler.set_epoch(epoch)
         # for input_ids, attn_mask, target in dataloader:
         for i, data in enumerate(train_dataloader):
             # Runs the forward pass under ``autocast``.
             accumulation_iteration = (i + 1) % iters_to_accumulate == 0
-            context_manager = nullcontext() if accumulation_iteration else model.no_sync()
+            context_manager = (
+                nullcontext() if accumulation_iteration else model.no_sync()
+            )
             with context_manager:
                 with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
                     output = model(
@@ -83,6 +87,7 @@ def train_loop_autocast(
                 if accumulation_iteration:
                     scaler.step(optimizer)
                     scaler.update()
+                    scheduler.step(step := step + 1)
                     optimizer.zero_grad()
 
     end_timer_and_print("Automatic precision", local_rank)
@@ -109,32 +114,25 @@ def main():
     num_labels = 5
     max_length = 256
     batch_size = 32
-    iters_to_accumulate = 1#1024//batch_size
+    iters_to_accumulate = 1
 
     num_epochs = 1
     learning_rate = 1e-4
     weight_decay = 0.01
+    warm_up_ratio = 0.05
     seed = 50
 
     torch.manual_seed(seed)
 
     init_process_group(backend="nccl")
-    n_process = int(os.environ["WORLD_SIZE"])
+    world_size = int(os.environ["WORLD_SIZE"])
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
-    print("Hello from", local_rank, rank)
+    print("Hello from", local_rank, rank, world_size)
 
-    model = AutoModelForSequenceClassification.from_pretrained(
-        model_name, num_labels=num_labels
+    dataset = load_dataset("mmcarpi/caroldb-sentences", split="hps").select(
+        range(100_000)
     )
-    model = torch.compile(model, disable=True).to(local_rank)
-    model = DDP(model, device_ids=[local_rank], output_device=local_rank)
-
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=learning_rate, weight_decay=weight_decay
-    )
-
-    dataset = load_dataset("mmcarpi/caroldb-sentences", split="hps")
     tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False)
 
     dataset = tokenize_dataset(dataset, tokenizer, max_length)
@@ -154,6 +152,26 @@ def main():
         pin_memory=True,
     )
 
+    model = AutoModelForSequenceClassification.from_pretrained(
+        model_name, num_labels=num_labels
+    )
+    model = torch.compile(model, disable=True).to(local_rank)
+    model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=learning_rate, weight_decay=weight_decay
+    )
+
+    total_steps = len(train_dataset) // (world_size * batch_size)
+    warm_up_steps = int(total_steps * warm_up_ratio)
+    if rank == 0:
+
+        print(f"{total_steps=} {warm_up_steps=}")
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lambda step: (step / warm_up_steps) if step < warm_up_steps else 1.0,
+    )
+
     loss_fn = torch.nn.CrossEntropyLoss().to(local_rank)
 
     print(f"[GPU{local_rank}] starting training soon...")
@@ -163,6 +181,7 @@ def main():
         model,
         train_dataloader,
         optimizer,
+        scheduler,
         loss_fn,
         num_epochs,
         iters_to_accumulate,
