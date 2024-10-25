@@ -1,46 +1,33 @@
+from functools import partial
+
 import numpy as np
-from datasets import load_dataset
 from sklearn import metrics
 
 
-def load_caroldb(seed=42):
-    dataset = load_dataset(
-        "parquet",
-        data_files={
-            "train": "Data/caroldb-train-sentences.parquet",
-            "test": "Data/caroldb-test-sentences.parquet",
-        },
-    )
+def tokenize_dataset(dataset, tokenizer, max_length):
+    def preprocess_function(examples, label2id, max_length):
+        processed = tokenizer(
+            examples["text"],
+            padding="max_length",
+            truncation=True,
+            max_length=max_length,
+        )
+        processed["label"] = [label2id[domain] for domain in examples["domain"]]
+        return processed
 
-    dataset_tmp = dataset["train"].train_test_split(
-        train_size=0.9, shuffle=True, seed=seed
+    domains = sorted(dataset.unique("domain"))
+    label2id = dict(zip(domains, range(len(domains))))
+    dataset = dataset.map(
+        partial(preprocess_function, label2id=label2id, max_length=max_length),
+        batched=True,
+        batch_size=2048,
+        keep_in_memory=True,
+        remove_columns=[
+            col for col in dataset.features.keys() if col not in ["domain", "text"]
+        ],
     )
-    dataset["train"] = dataset_tmp["train"]
-    dataset["eval"] = dataset_tmp["test"]
-    dataset["test"] = dataset["test"]
-    dataset = dataset.rename_column("domain", "label")
-    dataset = dataset.remove_columns(["source_typology", "carolina_typology"])
 
     return dataset
-
-
-def unique_labels(dataset, labels="labels"):
-    labels = set.union(*[set(v[labels]) for v in dataset.values()])
-    return labels
-
-
-def create_label2id(labels):
-    label2id = {l: i for i, l in enumerate(labels)}
-    return label2id
-
-
-def create_preprocess_function(tokenizer, label2id):
-    def preprocess_function(examples):
-        tokens = tokenizer(examples["text"], truncation=True, padding=True)
-        tokens["labels"] = [label2id[label] for label in examples["label"]]
-        return tokens
-
-    return preprocess_function
 
 
 def to_one_hot(y, num_labels):
@@ -50,10 +37,9 @@ def to_one_hot(y, num_labels):
 
 
 def create_compute_metrics(num_labels, argmax_first=False):
-    def compute_metrics(eval_pred):
-        predictions, labels = eval_pred
+    def compute_metrics(predictions, labels):
         if argmax_first:
-            predictions = np.argmax(predictions, axis=1)
+            predictions = predictions.argmax(axis=1)
 
         result = dict()
         result["cm"] = (
