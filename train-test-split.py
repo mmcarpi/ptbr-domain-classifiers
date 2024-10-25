@@ -23,7 +23,7 @@ for domain in df["domain"].unique():
         df.filter(pl.col("domain") == domain).sample(
             number_of_texts, shuffle=True, seed=random_state
         ),
-        in_place = True
+        in_place=True,
     )
 
 train, test = train_test_split(
