@@ -4,7 +4,6 @@ from functools import partial
 
 
 def tokenize_dataset(dataset, tokenizer, max_length):
-
     def preprocess_function(examples, label2id, max_length):
         processed = tokenizer(
             examples["text"],
