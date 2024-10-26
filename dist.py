@@ -1,8 +1,6 @@
 import argparse
-import gc
 import json
 import os
-import time
 
 from contextlib import nullcontext
 from dataclasses import dataclass, asdict
@@ -15,6 +13,7 @@ from torch.distributed import (
     init_process_group,
     destroy_process_group,
     all_gather,
+    all_reduce,
     barrier,
 )
 from torch.utils.data import DataLoader
@@ -28,28 +27,6 @@ from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
 import util
 
-start_time = None
-
-
-def start_timer():
-    global start_time
-    gc.collect()
-    torch.cuda.empty_cache()
-    torch.cuda.reset_peak_memory_stats()
-    torch.cuda.synchronize()
-    start_time = time.time()
-
-
-def end_timer_and_print(local_msg, local_rank):
-    torch.cuda.synchronize()
-    end_time = time.time()
-    print("\n" + local_msg)
-    print("Total execution time = %.3f sec" % (end_time - start_time))
-    print(
-        "Max memory used by tensors = %d bytes"
-        % (torch.cuda.max_memory_allocated(device=local_rank))
-    )
-
 
 @dataclass
 class DeviceConfig:
@@ -57,6 +34,7 @@ class DeviceConfig:
     local_rank: int
     world_size: int
     device_type: str
+    num_gpus_per_node: int
 
 
 @dataclass
@@ -70,8 +48,6 @@ class Config:
     warm_up_ratio: float
     learning_rate: float
 
-    iters_to_accumulate: int
-    save_every_epoch: bool
     save_path: str
 
     @classmethod
@@ -83,6 +59,35 @@ class Config:
     def save_config(self, path):
         with open(path, "w") as config_file:
             json.dump(asdict(self), config_file, indent=4)
+
+
+class AverageMeter:
+    def __init__(self, local_rank):
+        self.local_rank = local_rank
+        self.reset()
+
+    def __str__(self):
+        return f"{self.avg:.4f}"
+
+    def reset(self):
+        self.val = 0.0
+        self.avg = 0.0
+        self.sum = 0.0
+        self.cnt = 0.0
+
+    def update(self, val, n=1):
+        self.val = val
+        self.sum += n * val
+        self.cnt += n
+        self.avg = self.sum / self.cnt
+
+    def all_reduce(self):
+        total = torch.tensor(
+            [self.sum, self.cnt], dtype=torch.float32, device=self.local_rank
+        )
+        all_reduce(total, async_op=False)
+        self.sum, self.cnt = total.tolist()
+        self.avg = self.sum / self.cnt
 
 
 class Trainer:
@@ -107,6 +112,7 @@ class Trainer:
         self.local_rank = device_config.local_rank
         self.world_size = device_config.world_size
         self.device_type = device_config.device_type
+        self.num_gpus_per_node = device_config.num_gpus_per_node
         self.dtype = (
             torch.bfloat16
             if self.device_type == "cuda" and torch.cuda.is_bf16_supported()
@@ -120,26 +126,27 @@ class Trainer:
         num_epochs,
         start_epoch=0,
         evals_per_epoch=1,
+        accumulate_frequency=1,
+        log_frequency=1,
     ):
-        start_timer()
         self.model.train()
         scaler = GradScaler(device=self.device_type)
 
-        epoch_steps = len(train_dataloader.dataset) // (
-            train_dataloader.batch_size * self.world_size
-        )
+        epoch_steps = len(train_dataloader.dataset) // self.cfg.batch_size
+        total_steps = num_epochs * epoch_steps
 
-        iters_to_evaluate = epoch_steps // evals_per_epoch
+        evaluate_frequency = epoch_steps // evals_per_epoch
 
         step = start_epoch * epoch_steps
-
         for epoch in range(start_epoch, num_epochs):
             train_dataloader.sampler.set_epoch(epoch)
-            epoch_loss = torch.tensor(0.0, device=self.local_rank)
+            epoch_eval = 0
+            epoch_loss = AverageMeter(self.local_rank)
             for i, data in enumerate(train_dataloader):
                 # Runs the forward pass under ``autocast``.
-                eval_iteration = (i + 1) % iters_to_evaluate == 0
-                accumulation_iteration = (i + 1) % self.cfg.iters_to_accumulate == 0
+                accumulation_iteration = i % accumulate_frequency == 0
+                eval_iteration = i > 0 and i % evaluate_frequency == 0
+                log_iteration = i > 0 and i % log_frequency == 0
                 context_manager = (
                     nullcontext() if accumulation_iteration else self.model.no_sync()
                 )
@@ -157,8 +164,8 @@ class Trainer:
                             output,
                             data["label"].to(self.local_rank, non_blocking=True),
                         )
-                        loss /= self.cfg.iters_to_accumulate
-                        epoch_loss += loss
+                        loss /= accumulate_frequency
+                        epoch_loss.update(loss.item(), data["input_ids"].size(0))
                     scaler.scale(loss).backward()
                     if accumulation_iteration:
                         scaler.step(self.optimizer)
@@ -166,19 +173,23 @@ class Trainer:
                         self.scheduler.step(step := step + 1)
                         self.optimizer.zero_grad()
 
+                if log_iteration and self.rank == 0:
+                    print(
+                        f"[GPU{self.rank}] step {step}/{total_steps} | loss {epoch_loss}"
+                    )
+
                 if eval_iteration:
+                    epoch_eval += 1
                     metrics = self.eval(eval_dataloader)
-                    # all_reduce(epoch_loss, op=) Reduce?
-                    metrics["loss"] = epoch_loss.item() / (i + 1)
+                    metrics["loss"] = epoch_loss.avg
+                    barrier()
                     if self.rank == 0:
                         self.save_checkpoint(
                             metrics,
                             epoch,
-                            step,
+                            epoch_eval,
                         )
                     barrier()
-
-        # end_timer_and_print("Automatic precision", local_rank)
 
     def eval(self, eval_dataloader):
         model_state = self.model.training
@@ -219,23 +230,20 @@ class Trainer:
         self.model.training = model_state
         return metrics
 
-    def save_checkpoint(self, metrics, epoch, step):
-        checkpoint = {
-            "model_state": self.model.state_dict(),
-            # "optimizer_state": self.optimizer.state_dict(),
-            # "scheduler_state": self.scheduler.state_dict(),
-            # "epoch": epoch,
-            # "step": step,
-        }
-
+    def save_checkpoint(self, metrics, epoch, epoch_eval):
         base_path = Path(self.cfg.save_path)
         model_path = base_path / Path(self.cfg.model_name).name
         model_path.mkdir(parents=True, exist_ok=True)
-        save_path = model_path / f"checkpoint-{epoch}-{step}.pth"
+        save_path = model_path / f"checkpoint-{epoch}-{epoch_eval}.pth"
 
-        torch.save(checkpoint, save_path)
+        if isinstance(self.model, DDP):
+            torch.save(self.model.module.state_dict(), save_path)
+        else:
+            torch.save(self.model.state_dict(), save_path)
 
-        with open(model_path / f"metrics-{epoch}-{step}.json", "w") as metric_file:
+        with open(
+            model_path / f"metrics-{epoch}-{epoch_eval}.json", "w"
+        ) as metric_file:
             json.dump(metrics, metric_file, indent=True)
 
 
@@ -249,6 +257,7 @@ def main():
         local_rank=int(os.environ["LOCAL_RANK"]),
         world_size=int(os.environ["WORLD_SIZE"]),
         device_type="cuda" if torch.cuda.is_available() else "cpu",
+        num_gpus_per_node=torch.cuda.device_count() if torch.cuda.is_available() else 1,
     )
 
     train_config = Config.read_config(args.config_file)
@@ -269,9 +278,11 @@ def main():
     train_dataloader = DataLoader(
         dataset=train_dataset,
         sampler=train_sampler,
-        batch_size=train_config.batch_size,
+        batch_size=train_config.batch_size // device_config.num_gpus_per_node,
         shuffle=False,
         pin_memory=True,
+        num_workers=args.num_workers,
+        drop_last=True,
     )
 
     eval_dataset = temp_dataset["test"]
@@ -280,9 +291,11 @@ def main():
     eval_dataloader = DataLoader(
         dataset=eval_dataset,
         sampler=eval_sampler,
-        batch_size=train_config.batch_size,
+        batch_size=train_config.batch_size // device_config.num_gpus_per_node,
         shuffle=False,
         pin_memory=True,
+        num_workers=args.num_workers,
+        drop_last=True,
     )
 
     model = AutoModelForSequenceClassification.from_pretrained(
@@ -290,15 +303,17 @@ def main():
     ).to(device_config.local_rank)
 
     if args.load_checkpoint:
-        checkpoint = torch.load(args.load_checkpoint)
-        model.state_dict.load(checkpoint["model_state"])
+        state = torch.load(args.load_checkpoint, weights_only=True)
+        model.load_state_dict(state)
 
     # model = torch.compile(model, disable=args.disable).to(local_rank)
-    model = DDP(
-        model,
-        device_ids=[device_config.local_rank],
-        output_device=device_config.local_rank,
-    )
+
+    if device_config.world_size > 1:
+        model = DDP(
+            model,
+            device_ids=[device_config.local_rank],
+            output_device=device_config.local_rank,
+        )
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -306,11 +321,7 @@ def main():
         weight_decay=train_config.weight_decay,
     )
 
-    total_steps = (
-        args.num_epochs
-        * len(train_dataset)
-        // (device_config.world_size * train_config.batch_size)
-    )
+    total_steps = args.num_epochs * (len(train_dataset) // train_config.batch_size)
     warm_up_steps = int(total_steps * train_config.warm_up_ratio)
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(
@@ -327,10 +338,11 @@ def main():
     if device_config.rank == 0:
         print("Training Info:")
         for k, v in asdict(train_config).items():
-            print(f"{k}={v}")
+            print(f"{k!r}: {v!r}")
 
         if args.load_checkpoint:
-            print("Starting from:")
+            print("Loaded checkpoint:", args.load_checkpoint)
+    barrier()
 
     print(f"[GPU{device_config.rank}] starting training soon...")
     trainer = Trainer(
@@ -349,6 +361,8 @@ def main():
         args.num_epochs,
         start_epoch=args.start_epoch,
         evals_per_epoch=args.evals_per_epoch,
+        accumulate_frequency=args.accumulate_frequency,
+        log_frequency=args.log_frequency,
     )
     print(f"[GPU{device_config.rank}] finished training")
     destroy_process_group()
@@ -360,7 +374,10 @@ if __name__ == "__main__":
     parser.add_argument("num_epochs", type=int)
     parser.add_argument("evals_per_epoch", type=int)
 
-    parser.add_argument("--load-checkpoint", type=str, default="")
+    parser.add_argument("--num_workers", type=int, default=1)
+    parser.add_argument("--log_frequency", type=int, default=1)
+    parser.add_argument("--accumulate_frequency", type=int, default=1)
+    parser.add_argument("--load_checkpoint", type=str, default="")
     parser.add_argument("--start_epoch", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
 
