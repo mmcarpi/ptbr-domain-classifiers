@@ -23,7 +23,7 @@ def tokenize_dataset(dataset, tokenizer, max_length):
         batch_size=2048,
         keep_in_memory=True,
         remove_columns=[
-            col for col in dataset.features.keys() if col not in ["domain", "text"]
+            col for col in dataset.features.keys()
         ],
     )
 
