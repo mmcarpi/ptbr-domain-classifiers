@@ -113,9 +113,11 @@ class Trainer:
         self.world_size = device_config.world_size
         self.device_type = device_config.device_type
         self.num_gpus_per_node = device_config.num_gpus_per_node
+        self.is_distributed = device_config.world_size > 1
+        self.is_cuda = self.device_type == "cuda"
         self.dtype = (
             torch.bfloat16
-            if self.device_type == "cuda" and torch.cuda.is_bf16_supported()
+            if self.is_cuda and torch.cuda.is_bf16_supported()
             else torch.float32
         )
 
@@ -139,33 +141,27 @@ class Trainer:
 
         step = start_epoch * epoch_steps
         for epoch in range(start_epoch, num_epochs):
-            train_dataloader.sampler.set_epoch(epoch)
+            if self.is_distributed:
+                train_dataloader.sampler.set_epoch(epoch)
             epoch_eval = 0
             epoch_loss = AverageMeter(self.local_rank)
-            for i, data in enumerate(train_dataloader):
-                # Runs the forward pass under ``autocast``.
-                accumulation_iteration = i % accumulate_frequency == 0
-                eval_iteration = i > 0 and i % evaluate_frequency == 0
-                log_iteration = i > 0 and i % log_frequency == 0
+            for i, (input, label) in enumerate(train_dataloader, start=1):
+                accumulation_iteration = (
+                    not self.is_distributed
+                ) or i % accumulate_frequency == 0
+                eval_iteration = i % evaluate_frequency == 0
+                log_iteration = step % log_frequency == 0
                 context_manager = (
                     nullcontext() if accumulation_iteration else self.model.no_sync()
                 )
                 with context_manager:
                     with torch.autocast(device_type=self.device_type, dtype=self.dtype):
-                        output = self.model(
-                            input_ids=data["input_ids"].to(
-                                self.local_rank, non_blocking=True
-                            ),
-                            attention_mask=data["attention_mask"].to(
-                                self.local_rank, non_blocking=True
-                            ),
-                        ).logits
+                        output = self.model(**input).logits
                         loss = self.loss_fn(
-                            output,
-                            data["label"].to(self.local_rank, non_blocking=True),
+                            output, label.to(self.local_rank, non_blocking=True)
                         )
                         loss /= accumulate_frequency
-                        epoch_loss.update(loss.item(), data["input_ids"].size(0))
+                        epoch_loss.update(loss.item(), input["input_ids"].size(0))
                     scaler.scale(loss).backward()
                     if accumulation_iteration:
                         scaler.step(self.optimizer)
@@ -175,7 +171,7 @@ class Trainer:
 
                 if log_iteration and self.rank == 0:
                     print(
-                        f"[GPU{self.rank}] step {step}/{total_steps} | loss {epoch_loss}"
+                        f"[GPU{self.rank}] epoch {epoch+1}/{num_epochs} | step {step}/{total_steps} | loss {epoch_loss}"
                     )
 
                 if eval_iteration:
@@ -190,25 +186,22 @@ class Trainer:
                             epoch_eval,
                         )
                     barrier()
+                    self.model.train()
 
     def eval(self, eval_dataloader):
-        model_state = self.model.training
-        self.model.training = False
+        self.model.eval()
         with torch.no_grad():
             predictions = []
             labels = []
-            for data in eval_dataloader:
-                outputs = self.model(
-                    input_ids=data["input_ids"].to(self.local_rank, non_blocking=True),
-                    attention_mask=data["attention_mask"].to(
-                        self.local_rank, non_blocking=True
-                    ),
-                ).logits
+            for input, label in eval_dataloader:
+                outputs = self.model(**input).logits
                 predictions.append(outputs)
-                labels.append(data["label"])
+                labels.append(label)
 
-            predictions = torch.concatenate(predictions).to(self.local_rank)
-            labels = torch.concatenate(labels).to(self.local_rank)
+            predictions = torch.concatenate(predictions).to(
+                self.local_rank, non_blocking=True
+            )
+            labels = torch.concatenate(labels).to(self.local_rank, non_blocking=True)
 
             all_predictions = [
                 torch.zeros_like(predictions, device=self.local_rank)
@@ -227,7 +220,6 @@ class Trainer:
 
             metrics = self.compute_metrics(all_predictions, all_labels)
 
-        self.model.training = model_state
         return metrics
 
     def save_checkpoint(self, metrics, epoch, epoch_eval):
@@ -263,7 +255,7 @@ def main():
     train_config = Config.read_config(args.config_file)
 
     dataset = load_dataset("mmcarpi/caroldb-sentences", split="train").select(
-        range(1000)
+        range(1_333)
     )
     tokenizer = AutoTokenizer.from_pretrained(train_config.model_name, use_fast=False)
 
@@ -273,29 +265,44 @@ def main():
     temp_dataset = dataset.train_test_split(test_size=0.2)
 
     train_dataset = temp_dataset["train"]
-    train_sampler = DistributedSampler(train_dataset)
+    eval_dataset = temp_dataset["test"]
+
+    batch_size = train_config.batch_size // device_config.num_gpus_per_node
+
+    if device_config.world_size > 1:
+        train_sampler = DistributedSampler(train_dataset)
+        eval_sampler = DistributedSampler(eval_dataset, drop_last=True)
+    else:
+        train_sampler = None
+        eval_sampler = None
+
+    def collate_fn(data):
+        input_ids = torch.stack([item["input_ids"] for item in data])
+        attention_mask = torch.stack([item["attention_mask"] for item in data])
+        label = torch.stack([item["label"] for item in data])
+
+        input = dict(input_ids=input_ids, attention_mask=attention_mask)
+        return input, label
 
     train_dataloader = DataLoader(
         dataset=train_dataset,
         sampler=train_sampler,
-        batch_size=train_config.batch_size // device_config.num_gpus_per_node,
+        batch_size=batch_size,
         shuffle=False,
         pin_memory=True,
         num_workers=args.num_workers,
         drop_last=True,
+        collate_fn=collate_fn,
     )
-
-    eval_dataset = temp_dataset["test"]
-    eval_sampler = DistributedSampler(eval_dataset)
-
     eval_dataloader = DataLoader(
         dataset=eval_dataset,
         sampler=eval_sampler,
-        batch_size=train_config.batch_size // device_config.num_gpus_per_node,
+        batch_size=batch_size,
         shuffle=False,
         pin_memory=True,
         num_workers=args.num_workers,
         drop_last=True,
+        collate_fn=collate_fn,
     )
 
     model = AutoModelForSequenceClassification.from_pretrained(
