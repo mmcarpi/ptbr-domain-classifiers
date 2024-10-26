@@ -6,7 +6,5 @@
     "weight_decay": 0.0,
     "warm_up_ratio": 0.05,
     "learning_rate": 2.100737320394295e-05,
-    "iters_to_accumulate": 1,
-    "save_every_epoch": true,
     "save_path": "Models/"
 }
