@@ -254,15 +254,13 @@ def main():
 
     train_config = Config.read_config(args.config_file)
 
-    dataset = load_dataset("mmcarpi/caroldb-sentences", split="train").select(
-        range(1_333)
-    )
+    dataset = load_dataset("mmcarpi/caroldb-sentences", split="train")
     tokenizer = AutoTokenizer.from_pretrained(train_config.model_name, use_fast=False)
 
     dataset = util.tokenize_dataset(dataset, tokenizer, train_config.max_length)
     dataset = dataset.with_format("torch")
 
-    temp_dataset = dataset.train_test_split(test_size=0.2)
+    temp_dataset = dataset.train_test_split(test_size=0.01)
 
     train_dataset = temp_dataset["train"]
     eval_dataset = temp_dataset["test"]
