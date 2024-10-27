@@ -1,0 +1,10 @@
+{
+    "model_name": "PORTULAN/albertina-900m-portuguese-ptbr-encoder",
+    "num_labels": 5,
+    "batch_size": 32,
+    "max_length": 256,
+    "weight_decay": 0.1,
+    "warm_up_ratio": 0.15,
+    "learning_rate": 2.2639875571662473e-05,
+    "save_path": "Models/"
+}
