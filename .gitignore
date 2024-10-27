@@ -1,5 +1,5 @@
-Data
-Models
+*.parquet
+*.pth
 .ipynb_checkpoints
 __pycache__
 pbs_output/
