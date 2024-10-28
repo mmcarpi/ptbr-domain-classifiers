@@ -29,7 +29,7 @@ BATCH_SIZES=(32 16 8 4 2)
 for BATCH_SIZE in "${BATCH_SIZES[@]}"; do
     echo "Trying to train with batch size: $BATCH_SIZE"
 	        
-    if torchrun --standalone --nproc_per_node=2 hyperparameter-search.py "$MODEL_NAME" "$DATASET_NAME" "$NUM_LABELS" "$MAX_LENGTH" "$BATCH_SIZE" "$NUM_EPOCHS" "$NUM_TRIALS" --iters_to_accumulate=$(( ${BATCH_SIZES[0]} / $BATCH_SIZE )); then
+    if torchrun --standalone --nproc_per_node=2 hyperparameter-search.py "$MODEL_NAME" "$DATASET_NAME" "$NUM_LABELS" "$MAX_LENGTH" "$BATCH_SIZE" "$NUM_EPOCHS" "$NUM_TRIALS" --disable_compile --iters_to_accumulate=$(( ${BATCH_SIZES[0]} / $BATCH_SIZE )); then
 	    echo "Training succeeded with batch size: $BATCH_SIZE"
 	    exit 0  # Exit if training is successful
     else
