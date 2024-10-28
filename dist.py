@@ -141,14 +141,11 @@ class Trainer:
 
         step = start_epoch * epoch_steps
         for epoch in range(start_epoch, num_epochs):
-            if self.is_distributed:
-                train_dataloader.sampler.set_epoch(epoch)
+            train_dataloader.sampler.set_epoch(epoch)
             epoch_eval = 0
             epoch_loss = AverageMeter(self.local_rank)
             for i, (input, label) in enumerate(train_dataloader, start=1):
-                accumulation_iteration = (
-                    not self.is_distributed
-                ) or i % accumulate_frequency == 0
+                accumulation_iteration = i % accumulate_frequency == 0
                 eval_iteration = i % evaluate_frequency == 0
                 log_iteration = step % log_frequency == 0
                 context_manager = (
@@ -267,12 +264,8 @@ def main():
 
     batch_size = train_config.batch_size // device_config.num_gpus_per_node
 
-    if device_config.world_size > 1:
-        train_sampler = DistributedSampler(train_dataset)
-        eval_sampler = DistributedSampler(eval_dataset, drop_last=True)
-    else:
-        train_sampler = None
-        eval_sampler = None
+    train_sampler = DistributedSampler(train_dataset)
+    eval_sampler = DistributedSampler(eval_dataset, drop_last=True)
 
     def collate_fn(data):
         input_ids = torch.stack([item["input_ids"] for item in data])
@@ -313,12 +306,11 @@ def main():
 
     # model = torch.compile(model, disable=args.disable).to(local_rank)
 
-    if device_config.world_size > 1:
-        model = DDP(
-            model,
-            device_ids=[device_config.local_rank],
-            output_device=device_config.local_rank,
-        )
+    model = DDP(
+        model,
+        device_ids=[device_config.local_rank],
+        output_device=device_config.local_rank,
+    )
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
