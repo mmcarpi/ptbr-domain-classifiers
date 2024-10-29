@@ -94,6 +94,7 @@ def objective(single_trial, **kwargs):
     torch_seed = kwargs["torch_seed"]
     disable_compile = kwargs["disable_compile"]
     iters_to_accumulate = kwargs["iters_to_accumulate"]
+    num_gpus_per_node = torch.cuda.device_count() if torch.cuda.is_available() else 1
 
     learning_rate = trial.suggest_float("learning_rate", 2e-5, 1e-4, log=True)
     warm_up_ratio = trial.suggest_float("warm_up_ratio", 0.0, 0.2, step=0.05)
@@ -113,7 +114,7 @@ def objective(single_trial, **kwargs):
     train_dataloader = DataLoader(
         dataset=train_dataset,
         sampler=train_sampler,
-        batch_size=batch_size,
+        batch_size=batch_size // num_gpus_per_node,
         shuffle=False,
         pin_memory=True,
     )
@@ -123,7 +124,7 @@ def objective(single_trial, **kwargs):
     test_dataloader = DataLoader(
         test_dataset,
         sampler=test_sampler,
-        batch_size=batch_size,
+        batch_size=batch_size // num_gpus_per_node,
         shuffle=False,
         pin_memory=False,
     )
@@ -138,7 +139,7 @@ def objective(single_trial, **kwargs):
         model.parameters(), lr=learning_rate, weight_decay=weight_decay
     )
 
-    total_steps = len(train_dataset) // (world_size * batch_size)
+    total_steps = num_epochs * (len(train_dataset) // (world_size * batch_size))
     warm_up_steps = int(total_steps * warm_up_ratio)
     if rank == 0:
         print(f"{total_steps=} {warm_up_steps=}")
