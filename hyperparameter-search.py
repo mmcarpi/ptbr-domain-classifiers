@@ -96,7 +96,7 @@ def objective(single_trial, **kwargs):
     iters_to_accumulate = kwargs["iters_to_accumulate"]
     num_gpus_per_node = torch.cuda.device_count() if torch.cuda.is_available() else 1
 
-    learning_rate = trial.suggest_float("learning_rate", 1e-5, 1e-4, log=True)
+    learning_rate = trial.suggest_float("learning_rate", 1e-6, 1e-4, log=True)
     warm_up_ratio = trial.suggest_float("warm_up_ratio", 0.0, 0.2, step=0.05)
     weight_decay = trial.suggest_float("weight_decay", 0.0, 0.1, step=0.01)
 
