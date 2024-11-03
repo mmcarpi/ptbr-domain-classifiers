@@ -3,8 +3,8 @@
     "num_labels": 5,
     "batch_size": 32,
     "max_length": 256,
-    "weight_decay": 0.1,
-    "warm_up_ratio": 0.15,
-    "learning_rate": 2.2639875571662473e-05,
+    "weight_decay": 0.03,
+    "warm_up_ratio": 0.2,
+    "learning_rate": 3.6118600856349923e-06,
     "save_path": "Models/"
 }
