@@ -135,12 +135,12 @@ class Trainer:
         scaler = GradScaler(device=self.device_type)
 
         epoch_steps = len(train_dataloader.dataset) // self.cfg.batch_size
-        total_steps = num_epochs * epoch_steps
+        total_steps = (start_epoch + num_epochs) * epoch_steps
 
         evaluate_frequency = epoch_steps // evals_per_epoch
 
         step = start_epoch * epoch_steps
-        for epoch in range(start_epoch, num_epochs):
+        for epoch in range(start_epoch, start_epoch + num_epochs):
             train_dataloader.sampler.set_epoch(epoch)
             epoch_eval = 0
             epoch_loss = AverageMeter(self.local_rank)
@@ -161,14 +161,15 @@ class Trainer:
                         epoch_loss.update(loss.item(), input["input_ids"].size(0))
                     scaler.scale(loss).backward()
                     if accumulation_iteration:
+                        step += 1
                         scaler.step(self.optimizer)
                         scaler.update()
-                        self.scheduler.step(step := step + 1)
+                        self.scheduler.step()
                         self.optimizer.zero_grad()
 
                 if log_iteration and self.rank == 0:
                     print(
-                        f"[GPU{self.rank}] epoch {epoch+1}/{num_epochs} | step {step}/{total_steps} | loss {epoch_loss}"
+                        f"[GPU{self.rank}] epoch {epoch+1}/{start_epoch+num_epochs} | step {step}/{total_steps} | loss {epoch_loss} | learning_rate {self.scheduler.get_last_lr()}"
                     )
 
                 if eval_iteration:
@@ -250,6 +251,8 @@ def main():
     )
 
     train_config = Config.read_config(args.config_file)
+    if args.save_path:
+        train_config.save_path = args.save_path
 
     dataset = load_dataset("mmcarpi/caroldb-sentences", split="train")
     tokenizer = AutoTokenizer.from_pretrained(train_config.model_name, use_fast=False)
@@ -320,10 +323,14 @@ def main():
 
     total_steps = args.num_epochs * (len(train_dataset) // train_config.batch_size)
     warm_up_steps = int(total_steps * train_config.warm_up_ratio)
-
+    already_taken_steps = args.start_epoch * (
+        len(train_dataset) // train_config.batch_size
+    )
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer,
-        lambda step: (step / warm_up_steps) if step < warm_up_steps else 1.0,
+        lambda step: (step / warm_up_steps)
+        if step + already_taken_steps < warm_up_steps
+        else 1.0,
     )
 
     loss_fn = torch.nn.CrossEntropyLoss().to(device_config.local_rank)
@@ -377,6 +384,7 @@ if __name__ == "__main__":
     parser.add_argument("--load_checkpoint", type=str, default="")
     parser.add_argument("--start_epoch", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--save_path", type=str, default="")
 
     args = parser.parse_args()
 
