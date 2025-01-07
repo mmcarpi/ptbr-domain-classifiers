@@ -2,6 +2,7 @@
 datasets
 optuna
 optuna-integration
+polars
 scikit-learn
 sentencepiece
 torch
