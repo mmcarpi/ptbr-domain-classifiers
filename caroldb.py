@@ -1,6 +1,5 @@
 #!/usr/bin/env python
 # coding: utf-8
-import json
 import tarfile
 from collections import defaultdict
 from functools import partial
@@ -21,7 +20,6 @@ def extract_texts_from_xml(path, namespace, parseargs):
     for _, teidoc in etree.iterparse(path, **parseargs):
         value = dict()
         for ref in teidoc.findall(f".//{namespace}catRef[@target]"):
-            scheme, target = ref.get("scheme"), ref.get("target")
             value[ref.get("scheme")[1:].lower()] = ref.get("target")
         value["domain"] = "".join(
             e.text for e in teidoc.findall(f".//{namespace}domain")
