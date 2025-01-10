@@ -1,4 +1,6 @@
+import json
 from functools import partial
+from pathlib import Path
 
 import numpy as np
 from sklearn import metrics
@@ -20,7 +22,7 @@ def tokenize_dataset(dataset, tokenizer, max_length):
     dataset = dataset.map(
         partial(preprocess_function, label2id=label2id, max_length=max_length),
         batched=True,
-        batch_size=2048,
+        batch_size=512,
         keep_in_memory=True,
         remove_columns=[
             col for col in dataset.features.keys()
@@ -93,3 +95,8 @@ def create_compute_metrics(num_labels, argmax_first=False):
         return result
 
     return compute_metrics
+
+
+def save_metrics(metrics, file_name):
+    with open(file_name, "w") as metric_file:
+        json.dump(metrics, metric_file, indent=True)

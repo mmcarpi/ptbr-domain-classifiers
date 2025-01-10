@@ -1,5 +1,4 @@
 import argparse
-import json
 import os
 
 from contextlib import nullcontext
@@ -21,44 +20,10 @@ from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from datasets import load_dataset
-
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
-
 import util
-
-
-@dataclass
-class DeviceConfig:
-    rank: int
-    local_rank: int
-    world_size: int
-    device_type: str
-    num_gpus_per_node: int
-
-
-@dataclass
-class Config:
-    model_name: int
-    num_labels: int
-    batch_size: int
-    max_length: int
-
-    weight_decay: float
-    warm_up_ratio: float
-    learning_rate: float
-
-    save_path: str
-
-    @classmethod
-    def read_config(cls, path):
-        with open(path, "r") as config_file:
-            config = json.load(config_file)
-        return cls(**config)
-
-    def save_config(self, path):
-        with open(path, "w") as config_file:
-            json.dump(asdict(self), config_file, indent=4)
+from config import DeviceConfig, ModelConfig
 
 
 class AverageMeter:
@@ -100,6 +65,7 @@ class Trainer:
         compute_metrics,
         train_config,
         device_config,
+        save_path,
     ):
         self.model = model
         self.optimizer = optimizer
@@ -107,6 +73,8 @@ class Trainer:
         self.loss_fn = loss_fn
         self.compute_metrics = compute_metrics
         self.cfg = train_config
+
+        self.model_path = Path(save_path) / Path(self.cfg.model_name)
 
         self.rank = device_config.rank
         self.local_rank = device_config.local_rank
@@ -131,6 +99,7 @@ class Trainer:
         accumulate_frequency=1,
         log_frequency=1,
     ):
+        self.model_path.mkdir(parents=True, exist_ok=True)
         self.model.train()
         scaler = GradScaler(device=self.device_type)
 
@@ -178,13 +147,13 @@ class Trainer:
                     metrics["loss"] = epoch_loss.avg
                     barrier()
                     if self.rank == 0:
-                        self.save_checkpoint(
+                        util.save_metrics(
                             metrics,
-                            epoch,
-                            epoch_eval,
+                            self.model_path / f"metrics-{epoch}-{epoch_eval}.json"
                         )
                     barrier()
                     self.model.train()
+            self.save_checkpoint(epoch)
 
     def eval(self, eval_dataloader):
         self.model.eval()
@@ -220,21 +189,33 @@ class Trainer:
 
         return metrics
 
-    def save_checkpoint(self, metrics, epoch, epoch_eval):
-        base_path = Path(self.cfg.save_path)
-        model_path = base_path / Path(self.cfg.model_name).name
-        model_path.mkdir(parents=True, exist_ok=True)
-        save_path = model_path / f"checkpoint-{epoch}-{epoch_eval}.pth"
+    def save_checkpoint(self, epoch):
+        checkpoint_path = self.model_path / "checkpoint"
+        checkpoint_path.mkdir(exist_ok=True)
 
         if isinstance(self.model, DDP):
-            torch.save(self.model.module.state_dict(), save_path)
+            model_state_dict = self.model.module.state_dict()
         else:
-            torch.save(self.model.state_dict(), save_path)
+            model_state_dict = self.model.state_dict()
 
-        with open(
-            model_path / f"metrics-{epoch}-{epoch_eval}.json", "w"
-        ) as metric_file:
-            json.dump(metrics, metric_file, indent=True)
+        torch.save(
+            {
+                "epoch": epoch,
+                "state_dict": model_state_dict,
+                "optimizer": self.optimizer.state_dict(),
+                "scheduler": self.scheduler.state_dict(),
+            },
+            checkpoint_path / f"checkpoint-{epoch}.pth",
+        )
+
+
+def collate_fn(data):
+    input_ids = torch.stack([item["input_ids"] for item in data])
+    attention_mask = torch.stack([item["attention_mask"] for item in data])
+    label = torch.stack([item["label"] for item in data])
+
+    input = dict(input_ids=input_ids, attention_mask=attention_mask)
+    return input, label
 
 
 def main():
@@ -250,12 +231,10 @@ def main():
         num_gpus_per_node=torch.cuda.device_count() if torch.cuda.is_available() else 1,
     )
 
-    train_config = Config.read_config(args.config_file)
-    if args.save_path:
-        train_config.save_path = args.save_path
+    train_config = ModelConfig.load_config(args.model_config_file)
 
-    dataset = load_dataset("mmcarpi/caroldb-sentences", split="train")
-    tokenizer = AutoTokenizer.from_pretrained(train_config.model_name, use_fast=False)
+    dataset = load_dataset("mmcarpi/caroldb-sentences", split="train").select(range(10_000))
+    tokenizer = AutoTokenizer.from_pretrained(train_config.model_name, use_fast=True)
 
     dataset = util.tokenize_dataset(dataset, tokenizer, train_config.max_length)
     dataset = dataset.with_format("torch")
@@ -270,13 +249,6 @@ def main():
     train_sampler = DistributedSampler(train_dataset)
     eval_sampler = DistributedSampler(eval_dataset, drop_last=True)
 
-    def collate_fn(data):
-        input_ids = torch.stack([item["input_ids"] for item in data])
-        attention_mask = torch.stack([item["attention_mask"] for item in data])
-        label = torch.stack([item["label"] for item in data])
-
-        input = dict(input_ids=input_ids, attention_mask=attention_mask)
-        return input, label
 
     train_dataloader = DataLoader(
         dataset=train_dataset,
@@ -303,10 +275,6 @@ def main():
         train_config.model_name, num_labels=train_config.num_labels
     ).to(device_config.local_rank)
 
-    if args.load_checkpoint:
-        state = torch.load(args.load_checkpoint, weights_only=True)
-        model.load_state_dict(state)
-
     # model = torch.compile(model, disable=args.disable).to(local_rank)
 
     model = DDP(
@@ -323,15 +291,18 @@ def main():
 
     total_steps = args.num_epochs * (len(train_dataset) // train_config.batch_size)
     warm_up_steps = int(total_steps * train_config.warm_up_ratio)
-    already_taken_steps = args.start_epoch * (
-        len(train_dataset) // train_config.batch_size
-    )
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer,
-        lambda step: (step / warm_up_steps)
-        if step + already_taken_steps < warm_up_steps
-        else 1.0,
+        lambda step: (step / warm_up_steps) if step < warm_up_steps else 1.0,
     )
+
+    start_epoch = 0
+    if args.resume:
+        checkpoint = torch.load(args.resume, weights_only=False)
+        model.module.load_state_dict(checkpoint["state_dict"])
+        scheduler.load_state_dict(checkpoint["scheduler"])
+        optimizer.load_state_dict(checkpoint["optimizer"])
+        start_epoch = checkpoint["epoch"] + 1
 
     loss_fn = torch.nn.CrossEntropyLoss().to(device_config.local_rank)
 
@@ -341,11 +312,9 @@ def main():
 
     if device_config.rank == 0:
         print("Training Info:")
-        for k, v in asdict(train_config).items():
-            print(f"{k!r}: {v!r}")
-
-        if args.load_checkpoint:
-            print("Loaded checkpoint:", args.load_checkpoint)
+        print(train_config)
+        if args.resume:
+            print("Loaded checkpoint:", args.resume)
     barrier()
 
     print(f"[GPU{device_config.rank}] starting training soon...")
@@ -357,13 +326,14 @@ def main():
         compute_metrics,
         train_config,
         device_config,
+        args.save_path,
     )
 
     trainer.train(
         train_dataloader,
         eval_dataloader,
         args.num_epochs,
-        start_epoch=args.start_epoch,
+        start_epoch=start_epoch,
         evals_per_epoch=args.evals_per_epoch,
         accumulate_frequency=args.accumulate_frequency,
         log_frequency=args.log_frequency,
@@ -374,21 +344,17 @@ def main():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("config_file", type=str)
+    parser.add_argument("model_config_file", type=str)
     parser.add_argument("num_epochs", type=int)
     parser.add_argument("evals_per_epoch", type=int)
 
     parser.add_argument("--num_workers", type=int, default=1)
     parser.add_argument("--log_frequency", type=int, default=1)
     parser.add_argument("--accumulate_frequency", type=int, default=1)
-    parser.add_argument("--load_checkpoint", type=str, default="")
-    parser.add_argument("--start_epoch", type=int, default=0)
+    parser.add_argument("--resume", type=str, default="")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--save_path", type=str, default="")
+    parser.add_argument("--save_path", type=str, default="./output")
 
     args = parser.parse_args()
-
-    if args.start_epoch and not args.load_checkpoint:
-        parser.error("Argument --load-checkpoint is required to change epoch start")
 
     main()

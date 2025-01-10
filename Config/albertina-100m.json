@@ -5,6 +5,5 @@
     "max_length": 256,
     "weight_decay": 0.07,
     "warm_up_ratio": 0.00,
-    "learning_rate":  6.877492056007037e-06,
-    "save_path": "Models/"
+    "learning_rate": 6.877492056007037e-06
 }
