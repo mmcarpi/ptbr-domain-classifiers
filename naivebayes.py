@@ -1,12 +1,9 @@
 import json
 
 from datasets import load_dataset
-from sklearn.model_selection import train_test_split
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.naive_bayes import MultinomialNB
-from sklearn.metrics import classification_report, accuracy_score
 from sklearn.preprocessing import LabelEncoder
-import polars as pl
 
 import util
 

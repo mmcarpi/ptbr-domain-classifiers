@@ -1,6 +1,5 @@
 import json
 from functools import partial
-from pathlib import Path
 
 import numpy as np
 from sklearn import metrics

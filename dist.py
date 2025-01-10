@@ -2,7 +2,6 @@ import argparse
 import os
 
 from contextlib import nullcontext
-from dataclasses import dataclass, asdict
 from pathlib import Path
 
 import torch
@@ -138,7 +137,10 @@ class Trainer:
 
                 if log_iteration and self.rank == 0:
                     print(
-                        f"[GPU{self.rank}] epoch {epoch+1}/{start_epoch+num_epochs} | step {step}/{total_steps} | loss {epoch_loss} | learning_rate {self.scheduler.get_last_lr()}"
+                        (f"[GPU{self.rank}] epoch {epoch+1}/{start_epoch+num_epochs} |"
+                        f"step {step}/{total_steps} |"
+                        f"loss {epoch_loss} |"
+                        f"learning_rate {self.scheduler.get_last_lr()}")
                     )
 
                 if eval_iteration:
@@ -149,7 +151,7 @@ class Trainer:
                     if self.rank == 0:
                         util.save_metrics(
                             metrics,
-                            self.model_path / f"metrics-{epoch}-{epoch_eval}.json"
+                            self.model_path / f"metrics-{epoch}-{epoch_eval}.json",
                         )
                     barrier()
                     self.model.train()
@@ -233,7 +235,9 @@ def main():
 
     train_config = ModelConfig.load_config(args.model_config_file)
 
-    dataset = load_dataset("mmcarpi/caroldb-sentences", split="train").select(range(10_000))
+    dataset = load_dataset("mmcarpi/caroldb-sentences", split="train").select(
+        range(10_000)
+    )
     tokenizer = AutoTokenizer.from_pretrained(train_config.model_name, use_fast=True)
 
     dataset = util.tokenize_dataset(dataset, tokenizer, train_config.max_length)
@@ -248,7 +252,6 @@ def main():
 
     train_sampler = DistributedSampler(train_dataset)
     eval_sampler = DistributedSampler(eval_dataset, drop_last=True)
-
 
     train_dataloader = DataLoader(
         dataset=train_dataset,
