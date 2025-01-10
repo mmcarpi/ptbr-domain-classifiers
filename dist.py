@@ -1,4 +1,5 @@
 import argparse
+import multiprocessing
 import os
 
 from contextlib import nullcontext
@@ -14,7 +15,7 @@ from torch.distributed import (
     all_reduce,
     barrier,
 )
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 
@@ -62,7 +63,7 @@ class Trainer:
         scheduler,
         loss_fn,
         compute_metrics,
-        train_config,
+        model_config,
         device_config,
         save_path,
     ):
@@ -71,7 +72,7 @@ class Trainer:
         self.scheduler = scheduler
         self.loss_fn = loss_fn
         self.compute_metrics = compute_metrics
-        self.cfg = train_config
+        self.cfg = model_config
 
         self.model_path = Path(save_path) / Path(self.cfg.model_name)
 
@@ -137,10 +138,12 @@ class Trainer:
 
                 if log_iteration and self.rank == 0:
                     print(
-                        (f"[GPU{self.rank}] epoch {epoch+1}/{start_epoch+num_epochs} |"
-                        f"step {step}/{total_steps} |"
-                        f"loss {epoch_loss} |"
-                        f"learning_rate {self.scheduler.get_last_lr()}")
+                        (
+                            f"[GPU{self.rank}] epoch {epoch+1}/{start_epoch+num_epochs} |"
+                            f"step {step}/{total_steps} |"
+                            f"loss {epoch_loss} |"
+                            f"learning_rate {self.scheduler.get_last_lr()}"
+                        )
                     )
 
                 if eval_iteration:
@@ -211,13 +214,69 @@ class Trainer:
         )
 
 
-def collate_fn(data):
-    input_ids = torch.stack([item["input_ids"] for item in data])
-    attention_mask = torch.stack([item["attention_mask"] for item in data])
-    label = torch.stack([item["label"] for item in data])
+class CustomDataset(Dataset):
+    def __init__(self, texts, labels, tokenizer, max_length):
+        self.texts = texts
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self._create_labels(labels)
 
-    input = dict(input_ids=input_ids, attention_mask=attention_mask)
-    return input, label
+    def _create_labels(self, labels):
+        unique_labels = sorted(set(labels))
+        self.encoder = {label: i for i, label in enumerate(unique_labels)}
+        self.labels = [self.encoder[label] for label in labels]
+
+    def __len__(self):
+        return len(self.texts)
+
+    def __getitem__(self, idx):
+        text = self.texts[idx]
+        label = self.labels[idx]
+        encoding = self.tokenizer(
+            text,
+            add_special_tokens=True,
+            max_length=self.max_length,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt",
+        )
+        return {
+            "input_ids": encoding["input_ids"].squeeze(),
+            "attention_mask": encoding["attention_mask"].squeeze(),
+        }, label
+
+
+def create_dataloader(
+    texts,
+    labels,
+    tokenizer_name,
+    max_length,
+    batch_size,
+    num_workers=0,
+    is_distributed=False,
+):
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+    dataset = CustomDataset(texts, labels, tokenizer, max_length)
+
+    if is_distributed:
+        sampler = DistributedSampler(dataset)
+        shuffle = False  # shuffle must be false when using DistributedSampler
+    else:
+        sampler = None
+        shuffle = True
+
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        sampler=sampler,
+        pin_memory=True,
+        multiprocessing_context="fork"
+        if multiprocessing.get_start_method(allow_none=True) != "spawn"
+        else "spawn",
+    )
+    return dataloader
 
 
 def main():
@@ -233,49 +292,39 @@ def main():
         num_gpus_per_node=torch.cuda.device_count() if torch.cuda.is_available() else 1,
     )
 
-    train_config = ModelConfig.load_config(args.model_config_file)
+    model_config = ModelConfig.load_config(args.model_config_file)
 
-    dataset = load_dataset("mmcarpi/caroldb-sentences", split="train").select(
-        range(10_000)
-    )
-    tokenizer = AutoTokenizer.from_pretrained(train_config.model_name, use_fast=True)
-
-    dataset = util.tokenize_dataset(dataset, tokenizer, train_config.max_length)
-    dataset = dataset.with_format("torch")
+    dataset = load_dataset("mmcarpi/caroldb-sentences", split="train")
 
     temp_dataset = dataset.train_test_split(test_size=0.01)
 
-    train_dataset = temp_dataset["train"]
-    eval_dataset = temp_dataset["test"]
+    train_dataset = temp_dataset["train"].to_dict()
+    eval_dataset = temp_dataset["test"].to_dict()
 
-    batch_size = train_config.batch_size // device_config.num_gpus_per_node
+    batch_size = model_config.batch_size // device_config.num_gpus_per_node
 
-    train_sampler = DistributedSampler(train_dataset)
-    eval_sampler = DistributedSampler(eval_dataset, drop_last=True)
-
-    train_dataloader = DataLoader(
-        dataset=train_dataset,
-        sampler=train_sampler,
-        batch_size=batch_size,
-        shuffle=False,
-        pin_memory=True,
+    train_dataloader = create_dataloader(
+        train_dataset["text"],
+        train_dataset["domain"],
+        model_config.model_name,
+        model_config.max_length,
+        batch_size,
         num_workers=args.num_workers,
-        drop_last=True,
-        collate_fn=collate_fn,
+        is_distributed=device_config.world_size > 1,
     )
-    eval_dataloader = DataLoader(
-        dataset=eval_dataset,
-        sampler=eval_sampler,
-        batch_size=batch_size,
-        shuffle=False,
-        pin_memory=True,
+
+    eval_dataloader = create_dataloader(
+        eval_dataset["text"],
+        eval_dataset["domain"],
+        model_config.model_name,
+        model_config.max_length,
+        batch_size,
         num_workers=args.num_workers,
-        drop_last=True,
-        collate_fn=collate_fn,
+        is_distributed=device_config.world_size > 1,
     )
 
     model = AutoModelForSequenceClassification.from_pretrained(
-        train_config.model_name, num_labels=train_config.num_labels
+        model_config.model_name, num_labels=model_config.num_labels
     ).to(device_config.local_rank)
 
     # model = torch.compile(model, disable=args.disable).to(local_rank)
@@ -288,12 +337,12 @@ def main():
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
-        lr=train_config.learning_rate,
-        weight_decay=train_config.weight_decay,
+        lr=model_config.learning_rate,
+        weight_decay=model_config.weight_decay,
     )
 
-    total_steps = args.num_epochs * (len(train_dataset) // train_config.batch_size)
-    warm_up_steps = int(total_steps * train_config.warm_up_ratio)
+    total_steps = args.num_epochs * (len(train_dataset) // model_config.batch_size)
+    warm_up_steps = int(total_steps * model_config.warm_up_ratio)
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer,
         lambda step: (step / warm_up_steps) if step < warm_up_steps else 1.0,
@@ -310,12 +359,12 @@ def main():
     loss_fn = torch.nn.CrossEntropyLoss().to(device_config.local_rank)
 
     compute_metrics = util.create_compute_metrics(
-        train_config.num_labels, argmax_first=True
+        model_config.num_labels, argmax_first=True
     )
 
     if device_config.rank == 0:
         print("Training Info:")
-        print(train_config)
+        print(model_config)
         if args.resume:
             print("Loaded checkpoint:", args.resume)
     barrier()
@@ -327,7 +376,7 @@ def main():
         scheduler,
         loss_fn,
         compute_metrics,
-        train_config,
+        model_config,
         device_config,
         args.save_path,
     )

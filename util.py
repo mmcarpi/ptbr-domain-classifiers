@@ -1,34 +1,7 @@
 import json
-from functools import partial
 
 import numpy as np
 from sklearn import metrics
-
-
-def tokenize_dataset(dataset, tokenizer, max_length):
-    def preprocess_function(examples, label2id, max_length):
-        processed = tokenizer(
-            examples["text"],
-            padding="max_length",
-            truncation=True,
-            max_length=max_length,
-        )
-        processed["label"] = [label2id[domain] for domain in examples["domain"]]
-        return processed
-
-    domains = sorted(dataset.unique("domain"))
-    label2id = dict(zip(domains, range(len(domains))))
-    dataset = dataset.map(
-        partial(preprocess_function, label2id=label2id, max_length=max_length),
-        batched=True,
-        batch_size=512,
-        keep_in_memory=True,
-        remove_columns=[
-            col for col in dataset.features.keys()
-        ],
-    )
-
-    return dataset
 
 
 def to_one_hot(y, num_labels):
