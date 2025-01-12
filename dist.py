@@ -20,10 +20,11 @@ from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from datasets import load_dataset
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from transformers import AutoModelForSequenceClassification
 
 import util
 from config import DeviceConfig, ModelConfig
+from dataloader import create_dataloader
 
 
 class AverageMeter:
@@ -149,6 +150,7 @@ class Trainer:
                 if eval_iteration:
                     epoch_eval += 1
                     metrics = self.eval(eval_dataloader)
+                    eval_dataloader.dataset.set_use_cache(True)
                     metrics["loss"] = epoch_loss.avg
                     barrier()
                     if self.rank == 0:
@@ -158,6 +160,8 @@ class Trainer:
                         )
                     barrier()
                     self.model.train()
+            if epoch == start_epoch:
+                train_dataloader.dataset.set_use_cache(True)
             self.save_checkpoint(epoch)
 
     def eval(self, eval_dataloader):
@@ -246,39 +250,6 @@ class CustomDataset(Dataset):
         }, label
 
 
-def create_dataloader(
-    texts,
-    labels,
-    tokenizer_name,
-    max_length,
-    batch_size,
-    num_workers=0,
-    is_distributed=False,
-):
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
-    dataset = CustomDataset(texts, labels, tokenizer, max_length)
-
-    if is_distributed:
-        sampler = DistributedSampler(dataset)
-        shuffle = False  # shuffle must be false when using DistributedSampler
-    else:
-        sampler = None
-        shuffle = True
-
-    dataloader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=num_workers,
-        sampler=sampler,
-        pin_memory=True,
-        multiprocessing_context="fork"
-        if multiprocessing.get_start_method(allow_none=True) != "spawn"
-        else "spawn",
-    )
-    return dataloader
-
-
 def main():
     torch.manual_seed(args.seed)
 
@@ -298,14 +269,13 @@ def main():
 
     temp_dataset = dataset.train_test_split(test_size=0.01)
 
-    train_dataset = temp_dataset["train"].to_dict()
-    eval_dataset = temp_dataset["test"].to_dict()
+    train_dataset = temp_dataset["train"]
+    eval_dataset = temp_dataset["test"]
 
     batch_size = model_config.batch_size // device_config.num_gpus_per_node
 
     train_dataloader = create_dataloader(
-        train_dataset["text"],
-        train_dataset["domain"],
+        train_dataset,
         model_config.model_name,
         model_config.max_length,
         batch_size,
@@ -314,8 +284,7 @@ def main():
     )
 
     eval_dataloader = create_dataloader(
-        eval_dataset["text"],
-        eval_dataset["domain"],
+        eval_dataset,
         model_config.model_name,
         model_config.max_length,
         batch_size,
