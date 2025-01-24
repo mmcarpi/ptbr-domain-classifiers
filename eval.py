@@ -1,4 +1,5 @@
 import argparse
+import os
 import sys
 
 from pathlib import Path
@@ -10,7 +11,7 @@ from transformers import AutoModelForSequenceClassification
 
 import util
 from config import ModelConfig
-from dist import create_dataloader
+from dataloader import AutoTokenizer, CustomDataset, DataLoader
 
 parser = argparse.ArgumentParser()
 parser.add_argument("model_config_file", type=str)
@@ -31,22 +32,29 @@ def main():
         model_config.model_name, num_labels=model_config.num_labels
     )
 
+    device_type = 'cuda'if torch.cuda.is_available() else 'cpu'
+    device = torch.device(device_type) 
+    dtype=torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float32
+
     checkpoint = torch.load(
         args.model_path,
         weights_only=False,
-        map_location=torch.device("cpu"),
+        map_location=device,
     )
     model.load_state_dict(checkpoint["state_dict"])
+    model = torch.compile(model)
+    model = model.to(device)
 
-    dataset = load_dataset("mmcarpi/caroldb-sentences", split="test").to_dict()
-    dataloader = create_dataloader(
-        dataset["text"],
-        dataset["domain"],
-        model_config.model_name,
-        model_config.max_length,
-        model_config.batch_size,
+    dataset = load_dataset("mmcarpi/caroldb-sentences", split="test")
+
+    tokenizer = AutoTokenizer.from_pretrained(model_config.model_name)
+    dataset = CustomDataset(dataset, tokenizer, model_config.max_length)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=model_config.batch_size,
         num_workers=args.num_workers,
-        is_distributed=False,
+        shuffle=False,
+        pin_memory=False,
     )
 
     compute_metrics = util.create_compute_metrics(
@@ -56,14 +64,17 @@ def main():
     y_pred = []
     y_true = []
     model.eval()
-    with torch.no_grad():
+    with torch.no_grad(), torch.autocast(device_type=device_type, dtype=dtype):
         for x, y in dataloader:
+            x = {k : v.to(device) for k, v in x.items() }
+            y = y.to(device)
             y_true.append(y)
             y_pred.append(model(**x).logits)
 
     y_true = torch.concatenate(y_true).to("cpu").numpy()
-    y_pred = torch.concatenate(y_pred).to("cpu").numpy()
+    y_pred = torch.concatenate(y_pred).to("cpu", dtype=torch.float32).numpy()
     metrics = compute_metrics(y_pred, y_true)
+
     save_path = Path(args.save_path) / Path(model_config.model_name) / "eval.json"
     save_path.parent.mkdir(parents=True, exist_ok=True)
     util.save_metrics(metrics, save_path)

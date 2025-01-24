@@ -218,38 +218,6 @@ class Trainer:
         )
 
 
-class CustomDataset(Dataset):
-    def __init__(self, texts, labels, tokenizer, max_length):
-        self.texts = texts
-        self.tokenizer = tokenizer
-        self.max_length = max_length
-        self._create_labels(labels)
-
-    def _create_labels(self, labels):
-        unique_labels = sorted(set(labels))
-        self.encoder = {label: i for i, label in enumerate(unique_labels)}
-        self.labels = [self.encoder[label] for label in labels]
-
-    def __len__(self):
-        return len(self.texts)
-
-    def __getitem__(self, idx):
-        text = self.texts[idx]
-        label = self.labels[idx]
-        encoding = self.tokenizer(
-            text,
-            add_special_tokens=True,
-            max_length=self.max_length,
-            padding="max_length",
-            truncation=True,
-            return_tensors="pt",
-        )
-        return {
-            "input_ids": encoding["input_ids"].squeeze(),
-            "attention_mask": encoding["attention_mask"].squeeze(),
-        }, label
-
-
 def main():
     torch.manual_seed(args.seed)
 
