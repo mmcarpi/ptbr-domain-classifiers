@@ -1,7 +1,7 @@
 #!/usr/bin/bash
 
 #PBS -q duasgpus
-#PBS -N albertina-900m-train
+#PBS -N albertina-900m
 #PBS -l nodes=1:ppn=32
 #PBS -e pbs_output/albertina-900m-train-errors
 #PBS -o pbs_output/albertina-900m-train-output
@@ -18,9 +18,9 @@ export HF_HOME=venv/cache
 
 CONFIG="Config/albertina-900m.json"
 NUM_EPOCHS=5
-EVALS_PER_EPOCH=2
+EVALS_PER_EPOCH=4
 LOG_FREQUENCY=10
-NUM_WORKERS=4
+NUM_WORKERS=8
 
 torchrun --standalone --nproc_per_node=2 dist.py \
 	"$CONFIG" \
