@@ -140,7 +140,7 @@ class Trainer:
                 if log_iteration and self.rank == 0:
                     print(
                         (
-                            f"[GPU{self.rank}] epoch {epoch+1}/{start_epoch+num_epochs} |"
+                            f"[GPU{self.rank}] epoch {epoch + 1}/{start_epoch + num_epochs} |"
                             f"step {step}/{total_steps} |"
                             f"loss {epoch_loss} |"
                             f"learning_rate {self.scheduler.get_last_lr()}"
@@ -260,11 +260,20 @@ def main():
         is_distributed=device_config.world_size > 1,
     )
 
+    cpu = torch.device("cpu")
     model = AutoModelForSequenceClassification.from_pretrained(
         model_config.model_name, num_labels=model_config.num_labels
-    ).to(device_config.local_rank)
+    ).to(cpu)
 
+    start_epoch = 0
+    if args.resume:
+        # Load everything in cpu and then load
+        checkpoint = torch.load(args.resume, map_location=cpu, weights_only=False)
+        model.load_state_dict(checkpoint["state_dict"])
+        start_epoch = checkpoint["epoch"] + 1
     # model = torch.compile(model, disable=args.disable).to(local_rank)
+
+    model = model.to(device_config.local_rank)
 
     model = DDP(
         model,
@@ -278,6 +287,9 @@ def main():
         weight_decay=model_config.weight_decay,
     )
 
+    if args.resume:
+        optimizer.load_state_dict(checkpoint["optimizer"])
+
     total_steps = args.num_epochs * (len(train_dataset) // model_config.batch_size)
     warm_up_steps = int(total_steps * model_config.warm_up_ratio)
     scheduler = torch.optim.lr_scheduler.LambdaLR(
@@ -285,13 +297,8 @@ def main():
         lambda step: (step / warm_up_steps) if step < warm_up_steps else 1.0,
     )
 
-    start_epoch = 0
     if args.resume:
-        checkpoint = torch.load(args.resume, weights_only=False)
-        model.module.load_state_dict(checkpoint["state_dict"])
         scheduler.load_state_dict(checkpoint["scheduler"])
-        optimizer.load_state_dict(checkpoint["optimizer"])
-        start_epoch = checkpoint["epoch"] + 1
 
     loss_fn = torch.nn.CrossEntropyLoss().to(device_config.local_rank)
 
