@@ -93,21 +93,23 @@ class Trainer:
     def train(
         self,
         train_dataloader,
-        eval_dataloader,
+        # eval_dataloader,
         num_epochs,
         start_epoch=0,
-        evals_per_epoch=1,
+        # evals_per_epoch=1,
         accumulate_frequency=1,
         log_frequency=1,
     ):
         self.model_path.mkdir(parents=True, exist_ok=True)
         self.model.train()
-        scaler = GradScaler(device=self.device_type)
+        scaler = GradScaler(
+            device=self.device_type, enabled=self.model.module.dtype != torch.bfloat16
+        )
 
-        epoch_steps = len(train_dataloader.dataset) // self.cfg.batch_size
+        epoch_steps = len(train_dataloader.dataset) // (
+            self.cfg.batch_size * accumulate_frequency
+        )
         total_steps = (start_epoch + num_epochs) * epoch_steps
-
-        evaluate_frequency = epoch_steps // evals_per_epoch
 
         step = start_epoch * epoch_steps
         for epoch in range(start_epoch, start_epoch + num_epochs):
@@ -116,8 +118,6 @@ class Trainer:
             epoch_loss = AverageMeter(self.local_rank)
             for i, (input, label) in enumerate(train_dataloader, start=1):
                 accumulation_iteration = i % accumulate_frequency == 0
-                eval_iteration = i % evaluate_frequency == 0
-                log_iteration = step % log_frequency == 0
                 context_manager = (
                     nullcontext() if accumulation_iteration else self.model.no_sync()
                 )
@@ -131,35 +131,21 @@ class Trainer:
                         epoch_loss.update(loss.item(), input["input_ids"].size(0))
                     scaler.scale(loss).backward()
                     if accumulation_iteration:
-                        step += 1
+                        step += 1  # accumulate_frequency
                         scaler.step(self.optimizer)
                         scaler.update()
                         self.scheduler.step()
                         self.optimizer.zero_grad()
+                        if step % log_frequency == 0 and self.rank == 0:
+                            print(
+                                (
+                                    f"[GPU{self.rank}] epoch {epoch+1}/{start_epoch+num_epochs} |"
+                                    f"step {step}/{total_steps} |"
+                                    f"loss {epoch_loss} |"
+                                    f"learning_rate {self.scheduler.get_last_lr()}"
+                                )
+                            )
 
-                if log_iteration and self.rank == 0:
-                    print(
-                        (
-                            f"[GPU{self.rank}] epoch {epoch+1}/{start_epoch+num_epochs} |"
-                            f"step {step}/{total_steps} |"
-                            f"loss {epoch_loss} |"
-                            f"learning_rate {self.scheduler.get_last_lr()}"
-                        )
-                    )
-
-                if eval_iteration:
-                    epoch_eval += 1
-                    metrics = self.eval(eval_dataloader)
-                    eval_dataloader.dataset.set_use_cache(True)
-                    metrics["loss"] = epoch_loss.avg
-                    barrier()
-                    if self.rank == 0:
-                        util.save_metrics(
-                            metrics,
-                            self.model_path / f"metrics-{epoch}-{epoch_eval}.json",
-                        )
-                    barrier()
-                    self.model.train()
             if epoch == start_epoch:
                 train_dataloader.dataset.set_use_cache(True)
             self.save_checkpoint(epoch)
@@ -232,6 +218,7 @@ def main():
     )
 
     model_config = ModelConfig.load_config(args.model_config_file)
+    model_config.batch_size = args.batch_size or model_config.batch_size
 
     dataset = load_dataset("mmcarpi/caroldb-sentences", split="train")
 
@@ -262,9 +249,14 @@ def main():
 
     model = AutoModelForSequenceClassification.from_pretrained(
         model_config.model_name, num_labels=model_config.num_labels
-    ).to(device_config.local_rank)
+    ).to(
+        device_config.local_rank,
+        dtype=torch.bfloat16 if args.model_to_bfloat16 else None,
+    )
 
-    # model = torch.compile(model, disable=args.disable).to(local_rank)
+    if args.compile:
+        print("Compiling model, please wait...")
+        model = torch.compile(model)
 
     model = DDP(
         model,
@@ -276,9 +268,12 @@ def main():
         model.parameters(),
         lr=model_config.learning_rate,
         weight_decay=model_config.weight_decay,
+        fused=True,
     )
 
-    total_steps = args.num_epochs * (len(train_dataset) // model_config.batch_size)
+    total_steps = args.num_epochs * (
+        len(train_dataset) // (model_config.batch_size * args.accumulate_frequency)
+    )
     warm_up_steps = int(total_steps * model_config.warm_up_ratio)
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer,
@@ -287,7 +282,9 @@ def main():
 
     start_epoch = 0
     if args.resume:
-        checkpoint = torch.load(args.resume, weights_only=False)
+        checkpoint = torch.load(
+            args.resume, map_location=torch.device("cpu"), weights_only=False
+        )
         model.module.load_state_dict(checkpoint["state_dict"])
         scheduler.load_state_dict(checkpoint["scheduler"])
         optimizer.load_state_dict(checkpoint["optimizer"])
@@ -306,7 +303,6 @@ def main():
             print("Loaded checkpoint:", args.resume)
     barrier()
 
-    print(f"[GPU{device_config.rank}] starting training soon...")
     trainer = Trainer(
         model,
         optimizer,
@@ -318,16 +314,25 @@ def main():
         args.save_path,
     )
 
-    trainer.train(
-        train_dataloader,
-        eval_dataloader,
-        args.num_epochs,
-        start_epoch=start_epoch,
-        evals_per_epoch=args.evals_per_epoch,
-        accumulate_frequency=args.accumulate_frequency,
-        log_frequency=args.log_frequency,
-    )
-    print(f"[GPU{device_config.rank}] finished training")
+    if device_config.rank == 0:
+        print("device_dtype = ", trainer.dtype)
+
+    if args.eval:
+        print("Evaluating model")
+        trainer.eval(eval_dataloader)
+
+    else:
+        print(f"[GPU{device_config.rank}] starting training soon...")
+        trainer.train(
+            train_dataloader,
+            # eval_dataloader,
+            args.num_epochs,
+            start_epoch=start_epoch,
+            # evals_per_epoch=args.evals_per_epoch,
+            accumulate_frequency=args.accumulate_frequency,
+            log_frequency=args.log_frequency,
+        )
+        print(f"[GPU{device_config.rank}] finished training")
     destroy_process_group()
 
 
@@ -335,7 +340,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("model_config_file", type=str)
     parser.add_argument("num_epochs", type=int)
-    parser.add_argument("evals_per_epoch", type=int)
+    # parser.add_argument("evals_per_epoch", type=int)
 
     parser.add_argument("--num_workers", type=int, default=1)
     parser.add_argument("--log_frequency", type=int, default=1)
@@ -343,6 +348,10 @@ if __name__ == "__main__":
     parser.add_argument("--resume", type=str, default="")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--save_path", type=str, default="./output")
+    parser.add_argument("--compile", default=False, action="store_true")
+    parser.add_argument("--model_to_bfloat16", default=False, action="store_true")
+    parser.add_argument("--eval", default=False, action="store_true")
+    parser.add_argument("--batch_size", type=int, default=0)
 
     args = parser.parse_args()
 
