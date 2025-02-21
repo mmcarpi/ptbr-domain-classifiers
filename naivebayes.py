@@ -1,5 +1,7 @@
-import json
+import pickle
+from pathlib import Path
 
+import polars as pl
 from datasets import load_dataset
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.naive_bayes import MultinomialNB
@@ -16,7 +18,7 @@ def train_naive_bayes_tfidf(dataset, text_column, label_column):
     vectorizer = TfidfVectorizer(
         max_features=30_000,
         analyzer="word",
-        token_pattern=r"\b[a-z]+\b",
+        token_pattern=r"\b[a-zà-ú]+\b",
         lowercase=True,
         ngram_range=(1, 1),
         min_df=5,
@@ -32,6 +34,7 @@ def train_naive_bayes_tfidf(dataset, text_column, label_column):
 
     return classifier, vectorizer, encoder
 
+
 def evaluate_naive_bayes_tfidf(
     classifier, vectorizer, encoder, compute_metrics, dataset, text_column, label_column
 ):
@@ -42,9 +45,7 @@ def evaluate_naive_bayes_tfidf(
     x_test_tfidf = vectorizer.transform(x_test)
     y_pred = classifier.predict(x_test_tfidf)
 
-    metrics = compute_metrics(y_pred, y_true)
-
-    return metrics
+    return pl.DataFrame(dict(y_pred=y_pred, y_true=y_true))
 
 
 if __name__ == "__main__":
@@ -55,7 +56,7 @@ if __name__ == "__main__":
     )
 
     compute_metrics = util.create_compute_metrics(5, argmax_first=False)
-    metrics = evaluate_naive_bayes_tfidf(
+    result = evaluate_naive_bayes_tfidf(
         classifier,
         vectorizer,
         encoder,
@@ -64,6 +65,15 @@ if __name__ == "__main__":
         "text",
         "domain",
     )
+    rootpath = Path("Models/baseline/naive-bayes")
+    rootpath.mkdir(parents=True, exist_ok=True)
+    result.write_csv(rootpath / "eval.csv")
 
-    with open("results/cnnb.json", "w") as metric_file:
-        json.dump(metrics, metric_file, indent=True)
+    with open(rootpath / "classifier.pkl", "wb") as classifier_file:
+        pickle.dump(classifier, classifier_file)
+
+    with open(rootpath / "vectorizer.pkl", "wb") as vectorizer_file:
+        pickle.dump(vectorizer, vectorizer_file)
+
+    with open(rootpath / "encoder.pkl", "wb") as encoder_file:
+        pickle.dump(encoder, encoder_file)

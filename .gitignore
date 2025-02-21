@@ -1,5 +1,6 @@
 *.parquet
 *.pth
+*.pkl
 .ipynb_checkpoints
 __pycache__
 pbs_output/
