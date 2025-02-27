@@ -233,7 +233,7 @@ def main():
 
     model_config = ModelConfig.load_config(args.model_config_file)
 
-    dataset = load_dataset("mmcarpi/caroldb-sentences", split="train")
+    dataset = load_dataset("carolina-c4ai/carol-domain-sents", split="train")
 
     temp_dataset = dataset.train_test_split(test_size=0.01)
 

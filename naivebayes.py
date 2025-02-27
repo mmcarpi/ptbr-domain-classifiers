@@ -49,7 +49,7 @@ def evaluate_naive_bayes_tfidf(
 
 
 if __name__ == "__main__":
-    dataset = load_dataset("mmcarpi/caroldb-sentences", split=["train", "test"])
+    dataset = load_dataset("carolina-c4ai/carol-domain-sents", split=["train", "test"])
 
     classifier, vectorizer, encoder = train_naive_bayes_tfidf(
         dataset[0], "text", "domain"

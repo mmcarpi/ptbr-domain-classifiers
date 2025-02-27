@@ -16,7 +16,7 @@ export HF_DATASETS_CACHE=venv/cache
 export HF_HOME=venv/cache
 
 MODEL_NAME="neuralmind/bert-base-portuguese-cased" 
-DATASET_NAME="mmcarpi/caroldb-sentences"
+DATASET_NAME="carolina-c4ai/carol-domain-sents"
 NUM_LABELS=5
 MAX_LENGTH=256
 BATCH_SIZE=32

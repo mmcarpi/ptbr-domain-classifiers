@@ -16,4 +16,4 @@ df = df.explode("text")
 
 print(df)
 
-df.write_parquet("Data/caroldb-sentences.parquet")
+df.write_parquet("Data/carol-domain-sents.parquet")

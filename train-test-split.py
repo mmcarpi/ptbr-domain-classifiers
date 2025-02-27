@@ -5,7 +5,7 @@ random_state = 42
 min_sentence_length = 4
 max_sentence_length = 256
 hps_dataset_fraction = 0.01
-df = pl.read_parquet("Data/caroldb-sentences.parquet")
+df = pl.read_parquet("Data/carol-domain-sents.parquet")
 
 domains = df["domain"].unique()
 
@@ -30,6 +30,6 @@ train, test = train_test_split(
     df_balanced, train_size=0.8, shuffle=True, random_state=random_state
 )
 hyper = train.sample(fraction=hps_dataset_fraction, shuffle=True)
-hyper.write_parquet("Data/caroldb-hps-sentences.parquet")
-train.write_parquet("Data/caroldb-train-sentences.parquet")
-test.write_parquet("Data/caroldb-test-sentences.parquet")
+hyper.write_parquet("Data/carol-domain-sents-hps.parquet")
+train.write_parquet("Data/carol-domain-sents-train.parquet")
+test.write_parquet("Data/carol-domain-sents-test.parquet")

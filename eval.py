@@ -49,7 +49,7 @@ def main():
     model = torch.compile(model)
 
     tokenizer = AutoTokenizer.from_pretrained(model_config.model_name)
-    dataset = datasets.load_dataset("mmcarpi/caroldb-sentences", split="test")
+    dataset = datasets.load_dataset("carolina-c4ai/carol-domain-sents", split="test")
     dataset = CustomDataset(dataset, tokenizer, 512)
 
     dataloader = DataLoader(
