@@ -1,3 +1,4 @@
+from pathlib import Path
 import polars as pl
 from polyglot.text import Text
 
@@ -16,4 +17,5 @@ df = df.explode("text")
 
 print(df)
 
+Path('./Data').mkdir(exist_ok=True)
 df.write_parquet("Data/carol-domain-sents.parquet")

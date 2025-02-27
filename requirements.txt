@@ -3,6 +3,7 @@ datasets
 optuna
 optuna-integration
 polars
+git+https://github.com/aboSamoor/polyglot
 scikit-learn
 sentencepiece
 torch
