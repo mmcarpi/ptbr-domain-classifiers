@@ -18,7 +18,7 @@ Code used to fine-tune encoders for Brazilian Portuguese for discourse domain cl
 
 ## Model training and evaluation
 ### Baseline
-- [naivebayes.py](./naivebayes.py), script for training and evaluating naive Bayes classifier using [scikit-learn](https://scikit-learn.org/stable/)
+- [baseline.py](./baseline.py), script for training and evaluating naive Bayes and SVM classifiers using [scikit-learn](https://scikit-learn.org/stable/)
 ### Transformers
 - [config.py](./config.py), load and write model configuration files
 - [dataloader.py](./dataloader.py), custom dataset and dataloader used for model training
